@@ -1,1 +1,772 @@
 
+你是一位资深的全栈金融数据工程师。请帮我从零构建一个「个人使用的类理杏仁金融数据平台」，
+技术栈为 Python（后端 + 数据采集）+ 现代前端框架（React/Next.js 或 Vue），本地部署。
+
+=======================================================================
+一、项目背景与目标
+=======================================================================
+
+理杏仁（lixinger.com）是一个面向 A 股投资者的金融数据平台，核心价值在于：
+- 提供全市场股票的财务报表数据（利润表、资产负债表、现金流量表）
+- 提供各类估值指标（PE-TTM、PB、PS、股息率等）的历史序列
+- 支持自定义筛选器（如连续 N 年 ROE > 15%、PE < 20 等）
+- 提供可视化图表（估值历史分位、营收增长趋势等）
+
+本项目目标是构建一个个人本地版，不依赖理杏仁付费 API，而是通过以下两个数据源组合实现：
+  1. akshare（Python 开源金融数据库）—— 获取结构化的行情、财务、估值数据
+  2. Chrome MCP（浏览器自动化）—— 对 akshare 无法覆盖的数据进行补充爬取
+
+=======================================================================
+二、系统架构设计
+=======================================================================
+
+请按以下分层架构设计：
+
+┌─────────────────────────────────────────────────────┐
+│                   前端展示层                          │
+│  React/Next.js + ECharts/Recharts + TailwindCSS     │
+│  页面：仪表盘 / 股票详情 / 筛选器 / 自选股 / 估值图  │
+└──────────────────────┬──────────────────────────────┘
+                       │ REST API / WebSocket
+┌──────────────────────▼──────────────────────────────┐
+│                   后端服务层                          │
+│  FastAPI（Python）                                   │
+│  路由：/api/stocks /api/financials /api/screener ... │
+│  缓存：Redis（可选）                                 │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────┐
+│                   数据采集层                          │
+│  ┌─────────────────┐  ┌──────────────────────────┐  │
+│  │  akshare 模块    │  │  Chrome MCP 爬虫模块     │  │
+│  │  (结构化数据)    │  │  (补充数据/反爬页面)     │  │
+│  └────────┬────────┘  └────────────┬─────────────┘  │
+│           │                        │                 │
+│           ▼                        ▼                 │
+│  ┌─────────────────────────────────────────────────┐│
+│  │            数据清洗 & 标准化层                   ││
+│  └────────────────────┬────────────────────────────┘│
+└───────────────────────┼─────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────┐
+│                   持久化存储层                        │
+│  SQLite（轻量）或 PostgreSQL                         │
+│  表：stocks / financials / valuations / dividends    │
+│      / daily_quotes / custom_screeners / watchlist   │
+└─────────────────────────────────────────────────────┘
+
+=======================================================================
+三、数据源详细规划
+=======================================================================
+
+3.1 akshare 数据采集模块（主数据源）
+
+⚠️ 重要：akshare 是一个社区维护的开源项目，其接口名称、参数和返回格式
+更新较为频繁。在编写每一个 akshare 采集函数时，你必须：
+
+  (1) 先确认当前使用的 akshare 版本（pip show akshare），优先使用该版本的接口。
+  (2) 如果你不确定某个接口的准确名称或参数，请明确标注 [需验证]，
+      并提供备选方案，例如：
+        # [需验证] 以下接口名可能已变更
+        # 备选方案1: ak.stock_financial_abstract_sina(symbol)
+        # 备选方案2: ak.stock_financial_hk_report_em(symbol, "income")
+        # 如果报错，请查阅 https://akshare.akfamily.xyz/ 获取最新接口名
+  (3) 所有 akshare 调用必须包裹在 try-except 中，并在异常时打印：
+      - 失败的接口名和参数
+      - 建议的排查方向（"请检查 akshare 版本是否为最新: pip install akshare --upgrade"）
+      - 备选接口名（如果知道的话）
+  (4) 为每个采集函数添加一个 `fallback` 机制：如果主接口失败，
+      尝试调用备选接口（例如新浪源失败则尝试东方财富源）。
+
+请使用 akshare 库获取以下数据，每个数据类编写独立的采集函数：
+
+【A. 基础股票列表】
+- ak.stock_info_a_code_name() → 获取全市场 A 股代码和名称
+- 存储到 stocks 表：stock_code, stock_name, exchange(SH/SZ/BJ), listing_date, industry
+
+【B. 行情数据】
+- ak.stock_zh_a_hist(symbol, period="daily", start_date, end_date)
+  → 日K线：open, high, low, close, volume, amount, turnover_rate, amplitude
+- 按股票+日期范围拉取，增量更新（只拉取最新日期到数据库最新日期之间的数据）
+- 存储到 daily_quotes 表
+
+【C. 财务报表数据】
+- ak.stock_financial_report_sina(symbol, "income")    → 利润表
+- ak.stock_financial_report_sina(symbol, "balance")   → 资产负债表
+- ak.stock_financial_report_sina(symbol, "cash_flow") → 现金流量表
+- 字段标准化：统一字段名（中文→英文），统一单位（元/万元→元）
+- 存储到 financials 表，按 report_type(annual/quarterly) + report_date 索引
+
+【D. 估值指标】
+- ak.stock_a_indicator_lg(symbol) → PE-TTM, PB, PS-TTM, 总市值, 流通市值
+- 存储到 valuations 表
+
+【E. 分红数据】
+- ak.stock_dividents_cninfo(symbol) → 历年分红方案
+- 存储到 dividends 表：stock_code, ex_dividend_date, bonus_ratio, cash_dividend, ...
+
+【F. 行业与板块数据】
+- ak.stock_board_industry_name_em() → 行业板块列表
+- ak.stock_board_industry_cons_em(symbol=板块名) → 板块成分股
+- 存储到 industries / industry_members 表
+
+3.2 Chrome MCP 爬虫模块（补充数据源）
+
+当 akshare 无法满足需求时，使用 Chrome MCP 进行浏览器自动化爬取。
+Chrome MCP 的调用方式：
+  - mcp__chrome__navigate(url)        → 导航到目标页面
+  - mcp__chrome__get_visible_text()   → 获取页面可见文本
+  - mcp__chrome__get_clickable_elements() → 获取可点击元素
+  - mcp__chrome__click(element)       → 点击元素
+  - mcp__chrome__fill(element, text)  → 填写表单
+  - mcp__chrome__take_screenshot()    → 截图
+  - mcp__chrome__evaluate_js(script)  → 执行 JS 提取数据
+
+适用场景：
+【场景1】理杏仁网站数据补充
+  - 如果用户有理杏仁账号，可登录后爬取其特有指标
+    （如自由现金流收益率、ROIC、杜邦分析分解等）
+  - 流程：navigate → fill login form → click login → navigate to stock page
+    → evaluate_js 提取表格数据 → 结构化存储
+
+【场景2】东方财富/同花顺补充数据
+  - 爬取东方财富的资金流向数据
+  - 爬取同花顺的概念板块数据
+  - 流程类似，关键是用 evaluate_js 从 DOM 中提取表格/图表数据
+
+【场景3】公告与研报摘要
+  - 爬取巨潮资讯网的公告列表
+  - 爬取东方财富研报中心的研报摘要
+
+请为每个爬虫场景编写：
+  1. 数据提取函数（接收股票代码，返回结构化 dict）
+  2. 反爬策略（随机延时 2-5 秒、User-Agent 轮换、请求间隔控制）
+  3. 异常处理（页面加载超时、元素未找到、数据格式异常）
+  4. 结果缓存（同一股票同一天不重复爬取）
+
+=======================================================================
+四、数据库设计（SQLite）
+=======================================================================
+
+请设计以下核心表结构：
+
+-- 股票基础信息
+CREATE TABLE stocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code VARCHAR(10) NOT NULL,      -- 600519
+    stock_name VARCHAR(50) NOT NULL,      -- 贵州茅台
+    exchange VARCHAR(5) NOT NULL,         -- SH / SZ / BJ
+    listing_date DATE,
+    industry VARCHAR(50),
+    is_active BOOLEAN DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(stock_code)
+);
+
+-- 日线行情
+CREATE TABLE daily_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    trade_date DATE NOT NULL,
+    open DECIMAL(10,2),
+    high DECIMAL(10,2),
+    low DECIMAL(10,2),
+    close DECIMAL(10,2),
+    volume BIGINT,
+    amount DECIMAL(20,2),
+    turnover_rate DECIMAL(8,4),
+    amplitude DECIMAL(8,4),
+    UNIQUE(stock_code, trade_date),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+-- 财务报表（宽表设计，支持多报告期）
+CREATE TABLE financials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    report_type VARCHAR(10) NOT NULL,     -- annual / Q1 / Q2 / Q3
+    report_date DATE NOT NULL,            -- 报告期截止日
+    -- 利润表核心字段
+    total_revenue DECIMAL(20,2),
+    operating_revenue DECIMAL(20,2),
+    operating_cost DECIMAL(20,2),
+    gross_profit DECIMAL(20,2),
+    net_profit DECIMAL(20,2),
+    net_profit_deducted DECIMAL(20,2),    -- 扣非净利润
+    -- 资产负债表核心字段
+    total_assets DECIMAL(20,2),
+    total_liabilities DECIMAL(20,2),
+    total_equity DECIMAL(20,2),
+    goodwill DECIMAL(20,2),
+    -- 现金流量表核心字段
+    operating_cash_flow DECIMAL(20,2),
+    investing_cash_flow DECIMAL(20,2),
+    financing_cash_flow DECIMAL(20,2),
+    free_cash_flow DECIMAL(20,2),
+    -- 衍生指标（计算字段）
+    roe DECIMAL(8,4),
+    roa DECIMAL(8,4),
+    gross_margin DECIMAL(8,4),
+    net_margin DECIMAL(8,4),
+    debt_ratio DECIMAL(8,4),
+    UNIQUE(stock_code, report_type, report_date),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+-- 估值数据
+CREATE TABLE valuations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    trade_date DATE NOT NULL,
+    pe_ttm DECIMAL(12,2),
+    pb DECIMAL(12,2),
+    ps_ttm DECIMAL(12,2),
+    total_market_value DECIMAL(20,2),
+    circulating_market_value DECIMAL(20,2),
+    dividend_yield DECIMAL(8,4),
+    UNIQUE(stock_code, trade_date),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+-- 分红记录
+CREATE TABLE dividends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    ex_dividend_date DATE,
+    bonus_ratio DECIMAL(8,2),            -- 每10股送X股
+    cash_dividend DECIMAL(10,4),         -- 每股派息（元）
+    capital_increase DECIMAL(8,2),       -- 每10股转增X股
+    UNIQUE(stock_code, ex_dividend_date),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+-- 自选股列表
+CREATE TABLE watchlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code VARCHAR(10) NOT NULL,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT,
+    sort_order INTEGER DEFAULT 0,
+    UNIQUE(stock_code)
+);
+
+-- 自定义筛选条件
+CREATE TABLE screeners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name VARCHAR(100) NOT NULL,
+    conditions_json TEXT NOT NULL,        -- JSON 格式的筛选条件
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_run_at TIMESTAMP
+);
+
+请为以上表创建以下索引：
+  - daily_quotes: (stock_code, trade_date)
+  - financials: (stock_code, report_date)
+  - valuations: (stock_code, trade_date)
+
+=======================================================================
+五、后端 API 设计（FastAPI）
+=======================================================================
+
+请实现以下 RESTful API 端点：
+
+GET  /api/stocks                    → 股票列表（支持搜索、分页）
+GET  /api/stocks/{code}             → 单只股票详情
+GET  /api/stocks/{code}/quotes      → 行情数据（query: start_date, end_date, period）
+GET  /api/stocks/{code}/financials  → 财务报表（query: report_type, years）
+GET  /api/stocks/{code}/valuations  → 估值历史（query: start_date, end_date）
+GET  /api/stocks/{code}/dividends   → 分红历史
+GET  /api/stocks/{code}/dashboard   → 股票综合仪表盘数据（聚合以上所有）
+
+POST /api/screener/run              → 运行筛选器（body: conditions）
+GET  /api/screener/presets          → 获取预设筛选模板
+
+GET  /api/watchlist                 → 获取自选股列表
+POST /api/watchlist                 → 添加自选股
+DELETE /api/watchlist/{code}        → 删除自选股
+
+POST /api/collect/trigger           → 手动触发数据采集（body: scope=full/incremental）
+GET  /api/collect/status            → 获取采集任务状态
+
+每个 API 需要：
+  - Pydantic 模型定义请求/响应 schema
+  - 参数验证和错误处理
+  - 支持 CORS（前端本地开发需要）
+  - 日志记录
+
+=======================================================================
+六、数据采集调度器
+=======================================================================
+
+请实现一个数据采集调度系统：
+
+class DataCollector:
+    """统一数据采集调度器"""
+
+    def run_incremental_update(self):
+        """
+        增量更新流程（每日运行）：
+        1. 更新股票列表（检查新股/退市）
+        2. 更新最新交易日行情
+        3. 更新最新估值数据
+        4. 检查是否有新的财报披露
+        5. 更新分红数据
+        """
+
+    def run_full_refresh(self, stock_codes=None):
+        """
+        全量刷新流程（首次运行或定期）：
+        1. 拉取所有股票列表
+        2. 拉取所有股票近3年日线数据
+        3. 拉取所有股票近5年财务数据
+        4. 拉取所有股票估值历史
+        """
+
+    def _collect_akshare(self, data_type, symbol, **kwargs):
+        """
+        akshare 数据采集封装。
+        必须包含：
+          - try-except 异常捕获
+          - 接口失败时打印：失败的接口名、参数、建议排查方向
+          - fallback 机制：主接口失败后尝试备选接口
+          - 限流：每次请求间隔 0.5-1 秒
+          - 重试：最多重试 3 次，指数退避
+        """
+
+    def _collect_chrome_mcp(self, url, extraction_config):
+        """Chrome MCP 爬虫封装"""
+
+    def _save_to_db(self, data, table, conflict_strategy="upsert"):
+        """数据入库，支持 upsert（存在则更新，不存在则插入）"""
+
+调度方式：
+  - 使用 APScheduler 或简单的 schedule 库
+  - 增量更新：每个交易日收盘后（15:30）自动运行
+  - 全量刷新：每周日凌晨运行一次
+  - 支持通过 API 手动触发
+
+=======================================================================
+七、筛选器引擎
+=======================================================================
+
+请实现一个灵活的股票筛选器，支持以下条件类型：
+
+conditions 示例（JSON 格式）：
+{
+  "logic": "AND",  // AND / OR
+  "conditions": [
+    {
+      "field": "roe",
+      "operator": ">=",
+      "value": 15,
+      "period": "latest_annual",  // latest_annual / latest_quarter / avg_3y / avg_5y
+      "consecutive_years": 5      // 连续5年满足条件
+    },
+    {
+      "field": "pe_ttm",
+      "operator": "between",
+      "value": [5, 25]
+    },
+    {
+      "field": "gross_margin",
+      "operator": ">=",
+      "value": 40,
+      "period": "avg_3y"
+    },
+    {
+      "field": "debt_ratio",
+      "operator": "<",
+      "value": 60
+    },
+    {
+      "field": "net_profit_growth",
+      "operator": ">=",
+      "value": 10,
+      "period": "avg_3y"
+    },
+    {
+      "field": "dividend_yield",
+      "operator": ">=",
+      "value": 2
+    },
+    {
+      "field": "total_market_value",
+      "operator": ">=",
+      "value": 10000000000  // 100亿
+    },
+    {
+      "field": "industry",
+      "operator": "in",
+      "value": ["食品饮料", "医药生物"]
+    }
+  ],
+  "sort_by": "roe",
+  "sort_order": "desc",
+  "limit": 50
+}
+
+支持的 operator： >, <, >=, <=, ==, !=, between, in, not_in
+支持的 period： latest_annual, latest_quarter, ttm, avg_3y, avg_5y
+
+预设筛选模板：
+  1. "巴菲特选股"：ROE连续5年>15%，毛利率>40%，负债率<60%
+  2. "低估值价值股"：PE-TTM<15，PB<2，股息率>3%
+  3. "高成长股"：营收增长率>20%（3年复合），净利润增长率>25%
+  4. "现金流优秀"：经营现金流/净利润>1，自由现金流转正
+  5. "次新股掘金"：上市<3年，ROE>12%，营收增长>15%
+
+=======================================================================
+八、前端页面设计
+=======================================================================
+
+请使用 React + TailwindCSS + ECharts 实现以下页面：
+
+【页面1：仪表盘 Dashboard】
+  - 市场概览：上证/深证/创业板指数实时数据卡片
+  - 自选股列表：代码、名称、最新价、涨跌幅、PE-TTM、股息率
+  - 今日提醒：自选股中有财报披露/分红除权的提醒
+  - 快速筛选入口
+
+【页面2：股票详情页 /stock/:code】
+  - 左侧：公司基本信息、行业、市值
+  - 中间主区域（Tab 切换）：
+    Tab1 - 估值图：PE-TTM / PB 历史走势图 + 历史分位标注
+           （用 ECharts 折线图，叠加25%/50%/75%分位线）
+    Tab2 - 财务分析：
+           - 营收/净利润柱状图 + 增长率折线（双Y轴）
+           - ROE/毛利率/净利率趋势图
+           - 资产负债率趋势图
+           - 经营现金流 vs 净利润对比图
+    Tab3 - 分红历史：历年分红方案表格 + 每股派息柱状图
+    Tab4 - 行情K线：日K/周K/月K 图（可用 klinecharts 库）
+  - 右侧：关键指标卡片（最新PE、PB、ROE、股息率、市值）
+
+【页面3：筛选器 /screener】
+  - 条件构建器：可视化拖拽/选择条件（字段、运算符、值）
+  - 支持保存/加载筛选模板
+  - 结果列表：符合条件的股票表格，支持排序、导出CSV
+
+【页面4：自选股管理 /watchlist】
+  - 搜索添加股票
+  - 拖拽排序
+  - 批量导入/导出
+
+设计风格要求：
+  - 暗色主题为主（金融数据阅读舒适）
+  - 主色调：深蓝灰 (#1a1f2e) + 强调色青色 (#00d4aa)
+  - 字体：数字用等宽字体（DM Mono），中文用思源黑体
+  - 图表风格统一，配色与主题一致
+
+=======================================================================
+九、项目文件结构
+=======================================================================
+
+请按以下结构组织代码：
+
+lixinger-local/
+├── backend/
+│   ├── main.py                    # FastAPI 入口
+│   ├── config.py                  # 配置管理
+│   ├── database.py                # 数据库连接 & 初始化
+│   ├── models/                    # SQLAlchemy/Pydantic 模型
+│   │   ├── stock.py
+│   │   ├── financial.py
+│   │   ├── valuation.py
+│   │   └── watchlist.py
+│   ├── api/                       # API 路由
+│   │   ├── stocks.py
+│   │   ├── screener.py
+│   │   ├── watchlist.py
+│   │   └── collector.py
+│   ├── collectors/                # 数据采集模块
+│   │   ├── base.py                # 采集器基类（含重试、限流、fallback逻辑）
+│   │   ├── akshare_collector.py   # akshare 采集
+│   │   ├── chrome_collector.py    # Chrome MCP 采集
+│   │   └── scheduler.py           # 调度器
+│   ├── analyzers/                 # 数据分析计算
+│   │   ├── screener_engine.py     # 筛选器引擎
+│   │   └── metrics.py             # 财务指标计算
+│   ├── utils/
+│   │   ├── retry.py               # 重试装饰器
+│   │   ├── rate_limiter.py        # 请求限流
+│   │   ├── api_compat.py          # akshare 接口兼容层（见下方说明）
+│   │   └── logger.py
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── pages/
+│   │   │   ├── Dashboard.tsx
+│   │   │   ├── StockDetail.tsx
+│   │   │   ├── Screener.tsx
+│   │   │   └── Watchlist.tsx
+│   │   ├── components/
+│   │   │   ├── charts/
+│   │   │   │   ├── ValuationChart.tsx
+│   │   │   │   ├── FinancialChart.tsx
+│   │   │   │   └── KLineChart.tsx
+│   │   │   ├── StockTable.tsx
+│   │   │   ├── ScreenerBuilder.tsx
+│   │   │   └── MarketCard.tsx
+│   │   ├── services/              # API 调用封装
+│   │   ├── hooks/                 # 自定义 React Hooks
+│   │   ├── types/                 # TypeScript 类型定义
+│   │   └── styles/
+│   ├── package.json
+│   └── tailwind.config.js
+├── data/
+│   └── lixinger.db                # SQLite 数据库文件
+├── scripts/
+│   ├── init_db.py                 # 数据库初始化脚本
+│   ├── first_collect.py           # 首次全量采集脚本
+│   ├── check_akshare.py           # akshare 接口健康检查脚本（见下方说明）
+│   └── export_csv.py              # 数据导出脚本
+├── docker-compose.yml             # 可选：容器化部署
+└── README.md
+
+=======================================================================
+十、akshare 接口兼容层设计（重点）
+=======================================================================
+
+由于 akshare 接口更新频繁，请额外实现以下兼容机制：
+
+10.1 api_compat.py — 接口兼容层
+
+在 backend/utils/api_compat.py 中实现一个接口映射表和动态调用机制：
+
+```python
+# 接口映射配置：主接口 + 备选接口列表
+AKSHARE_API_MAP = {
+    "stock_list": {
+        "primary": "ak.stock_info_a_code_name",
+        "fallbacks": ["ak.stock_info_a_code_name"],
+        "description": "获取A股股票列表",
+    },
+    "daily_quotes": {
+        "primary": "ak.stock_zh_a_hist",
+        "fallbacks": ["ak.stock_zh_a_hist"],
+        "description": "获取日K线行情数据",
+        "params_transform": {
+            # 如果接口参数名变更，在这里做映射
+            # "symbol": "symbol",  # 主接口参数名 -> 备选接口参数名
+        }
+    },
+    "financial_income": {
+        "primary": "ak.stock_financial_report_sina",
+        "fallbacks": [
+            "ak.stock_financial_abstract_sina",
+            "ak.stock_financial_hk_report_em",
+        ],
+        "description": "获取利润表",
+        "params": {"report": "income"},
+    },
+    "financial_balance": {
+        "primary": "ak.stock_financial_report_sina",
+        "fallbacks": ["ak.stock_financial_abstract_sina"],
+        "description": "获取资产负债表",
+        "params": {"report": "balance"},
+    },
+    "financial_cashflow": {
+        "primary": "ak.stock_financial_report_sina",
+        "fallbacks": ["ak.stock_financial_abstract_sina"],
+        "description": "获取现金流量表",
+        "params": {"report": "cash_flow"},
+    },
+    "valuation_indicator": {
+        "primary": "ak.stock_a_indicator_lg",
+        "fallbacks": ["ak.stock_a_indicator_lg"],
+        "description": "获取估值指标",
+    },
+    "dividends": {
+        "primary": "ak.stock_dividents_cninfo",
+        "fallbacks": ["ak.stock_dividents_cninfo"],
+        "description": "获取分红数据",
+    },
+    "industry_list": {
+        "primary": "ak.stock_board_industry_name_em",
+        "fallbacks": ["ak.stock_board_industry_name_em"],
+        "description": "获取行业板块列表",
+    },
+    "industry_constituents": {
+        "primary": "ak.stock_board_industry_cons_em",
+        "fallbacks": ["ak.stock_board_industry_cons_em"],
+        "description": "获取板块成分股",
+    },
+}
+
+def call_akshare(api_key: str, **kwargs):
+    """
+    统一的 akshare 调用入口。
+    1. 从 AKSHARE_API_MAP 获取主接口和备选接口
+    2. 先尝试主接口
+    3. 主接口失败时，依次尝试 fallbacks
+    4. 所有接口都失败时，抛出详细异常信息，包含：
+       - 尝试过的所有接口名
+       - 每个接口的报错信息
+       - 建议：请运行 pip install akshare --upgrade
+       - 建议：请查阅 https://akshare.akfamily.xyz/ 获取最新接口名
+    5. 返回统一格式的数据（DataFrame 或 dict）
+    """
+    import akshare as ak
+    config = AKSHARE_API_MAP.get(api_key)
+    if not config:
+        raise ValueError(f"未知的 API key: {api_key}")
+
+    all_tried = []
+    # 尝试主接口
+    for api_path in [config["primary"]] + config.get("fallbacks", []):
+        try:
+            func = _resolve_function(ak, api_path)
+            merged_kwargs = {**config.get("params", {}), **kwargs}
+            result = func(**merged_kwargs)
+            return result
+        except Exception as e:
+            all_tried.append({"api": api_path, "error": str(e)})
+            logger.warning(f"akshare 接口 {api_path} 调用失败: {e}")
+            continue
+
+    # 所有接口都失败
+    error_msg = (
+        f"akshare 数据采集失败 [{config['description']}]\n"
+        f"尝试过的接口:\n"
+    )
+    for tried in all_tried:
+        error_msg += f"  - {tried['api']}: {tried['error']}\n"
+    error_msg += (
+        f"\n建议排查:\n"
+        f"  1. 运行 pip install akshare --upgrade 更新到最新版本\n"
+        f"  2. 查阅官方文档: https://akshare.akfamily.xyz/\n"
+        f"  3. 运行 python scripts/check_akshare.py 检查接口可用性\n"
+        f"  4. 如接口已变更，请更新 backend/utils/api_compat.py 中的映射表"
+    )
+    raise AkshareAPIError(error_msg)
+
+
+def _resolve_function(module, dotted_path: str):
+    """将 'ak.stock_info_a_code_name' 解析为实际函数对象"""
+    parts = dotted_path.split(".")
+    obj = module
+    for part in parts[1:]:  # 跳过 'ak'
+        obj = getattr(obj, part)
+    return obj
+```
+
+10.2 check_akshare.py — 接口健康检查脚本
+
+在 scripts/ 下创建一个检查脚本，首次运行或遇到报错时执行：
+
+```python
+"""
+akshare 接口健康检查脚本
+用法: python scripts/check_akshare.py
+功能: 逐一测试所有使用的 akshare 接口，生成可用性报告
+"""
+import akshare as ak
+from backend.utils.api_compat import AKSHARE_API_MAP
+
+def check_all_apis():
+    results = []
+    for key, config in AKSHARE_API_MAP.items():
+        api_path = config["primary"]
+        print(f"检查: {key} ({api_path}) ...")
+        try:
+            func = _resolve_function(ak, api_path)
+            # 用最小参数试探
+            if key == "stock_list":
+                result = func()
+            elif key in ["daily_quotes", "financial_income", "financial_balance",
+                         "financial_cashflow", "valuation_indicator", "dividends"]:
+                result = func("000001")  # 用平安银行试探
+            elif key == "industry_list":
+                result = func()
+            elif key == "industry_constituents":
+                result = func(symbol="饮料乳品")
+
+            status = "✅ 可用"
+            detail = f"返回 {len(result)} 条数据" if hasattr(result, '__len__') else "返回成功"
+        except Exception as e:
+            status = "❌ 不可用"
+            detail = str(e)
+
+        results.append({"key": key, "api": api_path, "status": status, "detail": detail})
+        print(f"  {status}: {detail}\n")
+
+    # 生成报告
+    print("\n" + "=" * 60)
+    print("akshare 接口健康检查报告")
+    print(f"akshare 版本: {ak.__version__}")
+    print("=" * 60)
+    for r in results:
+        print(f"  {r['status']} {r['key']}: {r['api']}")
+        if r['status'].startswith("❌"):
+            print(f"       错误: {r['detail']}")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    check_all_apis()
+```
+
+=======================================================================
+十一、开发优先级与里程碑
+=======================================================================
+
+请按以下优先级分阶段实现：
+
+Phase 1 — 最小可用版本（MVP）
+  ✅ 数据库设计与初始化
+  ✅ akshare 接口兼容层（api_compat.py + check_akshare.py）
+  ✅ akshare 基础数据采集（股票列表 + 行情 + 财务报表）
+  ✅ 后端 API：股票列表、股票详情、财务数据查询
+  ✅ 前端：股票详情页（估值图 + 财务趋势图）
+  ✅ 自选股管理
+
+Phase 2 — 筛选器
+  ✅ 筛选器引擎实现
+  ✅ 筛选器前端页面
+  ✅ 预设模板
+
+Phase 3 — Chrome MCP 补充
+  ✅ Chrome MCP 爬虫框架
+  ✅ 理杏仁登录 & 数据补充爬取
+  ✅ 东方财富资金流向爬取
+
+Phase 4 — 增强功能
+  ✅ 定时采集调度
+  ✅ 行业对比分析
+  ✅ 杜邦分析分解
+  ✅ 数据导出（CSV / Excel）
+
+=======================================================================
+十二、关键注意事项
+=======================================================================
+
+1. akshare 接口兼容性（最重要）：
+   akshare 是社区维护的开源项目，接口名称、参数、返回格式更新较为频繁。
+   你必须做到：
+   (a) 每个 akshare 调用都通过 api_compat.py 的 call_akshare() 统一入口，
+       而不是直接调用 ak.xxx()。这样当接口变更时，只需要修改映射表即可。
+   (b) 所有调用都必须有 try-except + fallback 机制。
+   (c) 首次运行项目时，先执行 python scripts/check_akshare.py 检查所有接口可用性。
+   (d) 如果你在生成代码时不确定某个接口的准确名称或参数，请明确标注 [需验证]，
+       并提供备选方案和官方文档链接。
+   (e) 在 README.md 中维护一个「接口变更日志」，记录每次接口变更和修复方式。
+
+2. 限流：akshare 和爬虫都需要控制请求频率，避免被封IP
+   - akshare：每次请求间隔 0.5-1 秒
+   - Chrome MCP：每次页面操作间隔 2-5 秒
+
+3. 数据一致性：使用 upsert 策略，同一数据重复采集不会产生重复记录
+
+4. 增量更新：只拉取缺失的数据，不要每次都全量覆盖
+
+5. 财务数据时间：A 股财报有固定披露时间（4月底前年报、8月底前半年报），
+   采集调度需要考虑这些时间节点
+
+6. 数值单位统一：akshare 返回的数据单位可能不一致（元/万元/亿元），
+   必须在入库前统一为"元"
+
+7. Chrome MCP 爬取的页面结构可能变化，提取逻辑需要配置化，
+   方便后续维护调整
+
+请从 Phase 1 开始，逐个文件生成完整可运行的代码。
+每个文件生成后请说明其功能和关键设计决策。
