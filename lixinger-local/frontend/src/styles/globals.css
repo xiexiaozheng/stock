@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 全局基础样式 */
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-bg-primary text-text-primary font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* 滚动条样式 */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-bg-secondary;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border-light rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-accent-dark;
+  }
+}
+
+@layer components {
+  /* 卡片样式 */
+  .card {
+    @apply bg-bg-card rounded-xl border border-border p-4;
+  }
+
+  /* 数值显示 */
+  .num {
+    @apply font-mono;
+  }
+
+  /* 涨跌颜色 */
+  .rise {
+    @apply text-rise;
+  }
+
+  .fall {
+    @apply text-fall;
+  }
+
+  /* 标签徽章 */
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  /* 按钮样式 */
+  .btn-primary {
+    @apply bg-accent text-bg-primary hover:bg-accent-light 
+           px-4 py-2 rounded-lg font-medium transition-colors duration-200
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-bg-hover text-text-primary hover:bg-border-light 
+           px-4 py-2 rounded-lg font-medium transition-colors duration-200
+           border border-border;
+  }
+
+  /* 表格样式 */
+  .data-table {
+    @apply w-full text-sm;
+  }
+
+  .data-table thead th {
+    @apply px-3 py-2 text-left text-text-secondary font-medium border-b border-border
+           sticky top-0 bg-bg-card;
+  }
+
+  .data-table tbody tr {
+    @apply border-b border-border/50 hover:bg-bg-hover transition-colors cursor-pointer;
+  }
+
+  .data-table tbody td {
+    @apply px-3 py-2.5;
+  }
+
+  /* 输入框样式 */
+  .input {
+    @apply bg-bg-secondary border border-border rounded-lg px-3 py-2 text-sm
+           text-text-primary placeholder-text-muted
+           focus:outline-none focus:ring-1 focus:ring-accent focus:border-accent
+           transition-colors;
+  }
+
+  /* 选项卡 */
+  .tab {
+    @apply px-4 py-2 text-sm font-medium text-text-secondary 
+           hover:text-text-primary border-b-2 border-transparent
+           transition-colors cursor-pointer;
+  }
+
+  .tab.active {
+    @apply text-accent border-accent;
+  }
+}
