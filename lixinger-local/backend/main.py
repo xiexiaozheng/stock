@@ -23,6 +23,7 @@ from api.stocks import router as stocks_router
 from api.screener import router as screener_router
 from api.watchlist import router as watchlist_router
 from api.collector import router as collector_router
+from api.core import router as core_router
 
 # 初始化日志
 setup_logging()
@@ -51,6 +52,7 @@ app.include_router(stocks_router)
 app.include_router(screener_router)
 app.include_router(watchlist_router)
 app.include_router(collector_router)
+app.include_router(core_router)
 
 
 @app.on_event("startup")

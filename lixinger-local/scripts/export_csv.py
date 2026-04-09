@@ -19,7 +19,10 @@ from database import engine
 from sqlalchemy import text
 
 
-ALLOWED_TABLES = ["stocks", "daily_quotes", "financials", "valuations", "dividends", "watchlist"]
+ALLOWED_TABLES = [
+    "stocks", "daily_quotes", "financials", "valuations", "dividends", "watchlist",
+    "stock_basic", "daily_market_valuation", "quarterly_finance",
+]
 
 
 def export_table(table: str, code: str = None, output: str = None):
@@ -29,8 +32,12 @@ def export_table(table: str, code: str = None, output: str = None):
 
     query = f"SELECT * FROM {table}"
     params = {}
-    if code and table != "stocks":
-        query += " WHERE stock_code = :code"
+    if code and table not in ("stocks", "stock_basic"):
+        # 新核心表使用 ts_code 而非 stock_code
+        if table in ("daily_market_valuation", "quarterly_finance"):
+            query += " WHERE ts_code = :code"
+        else:
+            query += " WHERE stock_code = :code"
         params["code"] = code
 
     with engine.connect() as conn:

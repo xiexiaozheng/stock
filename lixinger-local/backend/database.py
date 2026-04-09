@@ -44,21 +44,29 @@ def get_db():
 
 def init_db():
     """初始化数据库，创建所有表"""
+    # 旧表模型（保持向后兼容）
     from models.stock import Stock, DailyQuote, Watchlist
     from models.financial import Financial
     from models.valuation import Valuation, Dividend
     from models.screener import Screener, Industry, IndustryMember
+    # 新核心表模型
+    from models.core import StockBasic, DailyMarketValuation, QuarterlyFinance
 
     Base.metadata.create_all(bind=engine)
 
     # 创建索引（如果不存在）
     with engine.connect() as conn:
         indexes = [
+            # 旧表索引
             "CREATE INDEX IF NOT EXISTS idx_daily_quotes_stock_date ON daily_quotes(stock_code, trade_date)",
             "CREATE INDEX IF NOT EXISTS idx_financials_stock_date ON financials(stock_code, report_date)",
             "CREATE INDEX IF NOT EXISTS idx_valuations_stock_date ON valuations(stock_code, trade_date)",
             "CREATE INDEX IF NOT EXISTS idx_stocks_code ON stocks(stock_code)",
             "CREATE INDEX IF NOT EXISTS idx_dividends_stock ON dividends(stock_code)",
+            # 新核心表索引（联合索引已在 __table_args__ 中声明，此处补充单列索引）
+            "CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry)",
+            "CREATE INDEX IF NOT EXISTS idx_dmv_ts_code ON daily_market_valuation(ts_code)",
+            "CREATE INDEX IF NOT EXISTS idx_qf_ts_code ON quarterly_finance(ts_code)",
         ]
         for idx_sql in indexes:
             conn.execute(text(idx_sql))
