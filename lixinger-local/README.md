@@ -2,6 +2,7 @@
 
 > 基于 [akshare](https://akshare.akfamily.xyz/) + FastAPI + React 构建的本地个人金融数据平台，
 > 功能对标 [lixinger.com](https://www.lixinger.com/)，完全本地部署，无需付费 API。
+> 数据获取与分析逻辑参考 [daily_stock_analysis](https://github.com/ZhuLinsen/daily_stock_analysis)。
 
 ---
 
@@ -10,11 +11,14 @@
 - **股票列表**：全市场 A 股（沪/深/北），支持搜索
 - **行情数据**：日 K 线图（前复权），增量更新
 - **财务分析**：利润表、资产负债表、现金流量表，自动计算 ROE/毛利率/负债率等衍生指标
-- **估值历史**：PE-TTM / PB / PS-TTM 历史曲线，含历史分位线标注
+- **估值历史**：PE-TTM / PB / PS-TTM / PCF-TTM / 股息率历史曲线，含历史分位线标注
 - **分红记录**：历年派息/送转记录
 - **筛选器**：多条件组合选股（AND/OR），支持多时间窗口，内置5个预设模板
 - **自选股**：添加/删除/导出 CSV
 - **数据采集**：定时增量更新（每个交易日 15:35）+ 每周全量刷新，支持手动触发
+- **核心数据表**：三张高性能核心表（StockBasic / DailyMarketValuation / QuarterlyFinance），联合主键 + 联合索引优化查询
+- **指标计算框架**：策略模式 (Strategy Pattern) 基类接口，支持插件化扩展量化指标
+- **内置指标**：PE 百分位、PB 百分位、股息率百分位
 
 ---
 
@@ -83,20 +87,26 @@ lixinger-local/
 │   │   ├── stock.py               # stocks / daily_quotes / watchlist
 │   │   ├── financial.py           # financials
 │   │   ├── valuation.py           # valuations / dividends
-│   │   └── screener.py            # screeners / industries
+│   │   ├── screener.py            # screeners / industries
+│   │   └── core.py                # ★ 核心表: StockBasic / DailyMarketValuation / QuarterlyFinance
 │   ├── api/                       # FastAPI 路由
 │   │   ├── stocks.py              # 股票列表/详情/行情/财务/估值/仪表盘
 │   │   ├── screener.py            # 筛选器运行/预设/保存
 │   │   ├── watchlist.py           # 自选股管理
-│   │   └── collector.py           # 数据采集触发/状态
+│   │   ├── collector.py           # 数据采集触发/状态
+│   │   └── core.py                # ★ 核心表API + 指标计算 API
 │   ├── collectors/                # 数据采集
 │   │   ├── base.py                # 基类（upsert、限流）
-│   │   ├── akshare_collector.py   # akshare 主采集器
+│   │   ├── akshare_collector.py   # akshare 主采集器（旧表）
+│   │   ├── core_collector.py      # ★ 核心表采集器（日度量价估值 + 季度财务）
 │   │   ├── chrome_collector.py    # Chrome MCP 补充爬虫（框架）
-│   │   └── scheduler.py           # 调度器（增量/全量）
+│   │   └── scheduler.py           # 调度器（增量/全量，含核心表）
 │   ├── analyzers/
 │   │   ├── screener_engine.py     # 筛选引擎（多条件、多时间窗口）
-│   │   └── metrics.py             # 增长率、分位数等指标计算
+│   │   ├── metrics.py             # 增长率、分位数等指标计算
+│   │   ├── data_reader.py         # ★ 数据读取接口（标准化 DataFrame 访问）
+│   │   ├── indicator_framework.py # ★ 指标计算基类 + 注册表（策略模式）
+│   │   └── builtin_indicators.py  # ★ 内置指标（PE/PB/股息率百分位）
 │   ├── utils/
 │   │   ├── api_compat.py          # akshare 接口兼容层（主要维护点）
 │   │   ├── retry.py               # 指数退避重试装饰器
@@ -128,9 +138,9 @@ lixinger-local/
 │   └── lixinger.db                # SQLite 数据库
 ├── scripts/
 │   ├── init_db.py                 # 数据库初始化
-│   ├── first_collect.py           # 首次全量采集
+│   ├── first_collect.py           # 首次全量采集（支持 --core-only 模式）
 │   ├── check_akshare.py           # akshare 接口健康检查
-│   └── export_csv.py              # 数据导出
+│   └── export_csv.py              # 数据导出（含核心表）
 ├── docker-compose.yml
 └── README.md                      # 本文档
 ```
@@ -138,6 +148,8 @@ lixinger-local/
 ---
 
 ## 数据库表结构
+
+### 旧表（保持向后兼容）
 
 | 表名 | 说明 |
 |---|---|
@@ -150,6 +162,14 @@ lixinger-local/
 | screeners | 保存的筛选条件 |
 | industries | 行业板块 |
 | industry_members | 板块成分股 |
+
+### ★ 核心表（新增，高性能设计）
+
+| 表名 | 主键 | 说明 |
+|---|---|---|
+| stock_basic | ts_code | 股票基础信息（带后缀代码，如 000001.SZ） |
+| daily_market_valuation | ts_code + trade_date | 日度量价与估值（收盘价、换手率、PE/PB/PS/PCF/股息率、总市值） |
+| quarterly_finance | ts_code + end_date | 季度财务核心（营收、净利润、扣非、经营现金流、ROE、毛利率、资产负债率） |
 
 ---
 
@@ -237,6 +257,18 @@ akshare 接口更新较频繁。本项目通过 `backend/utils/api_compat.py` �
 | POST | /api/collect/trigger | 触发数据采集 |
 | GET | /api/collect/status | 采集任务状态 |
 
+### ★ 核心表 API（新增）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/core/stocks | 股票基础信息列表 |
+| GET | /api/core/stocks/{ts_code} | 单只股票基础信息 |
+| GET | /api/core/stocks/{ts_code}/daily | 日度量价与估值数据 |
+| GET | /api/core/stocks/{ts_code}/finance | 季度财务核心数据 |
+| GET | /api/core/stocks/{ts_code}/dashboard | 核心表综合仪表盘 |
+| GET | /api/core/indicators | 列出所有已注册指标 |
+| GET | /api/core/stocks/{ts_code}/indicator/{name} | 计算指定指标 |
+
 ---
 
 ## 开发说明
@@ -269,6 +301,69 @@ akshare 接口更新较频繁。本项目通过 `backend/utils/api_compat.py` �
 支持的 `operator`：`>`, `<`, `>=`, `<=`, `==`, `!=`, `between`, `in`, `not_in`
 
 支持的 `period`：`latest_annual`, `latest_quarter`, `ttm`, `avg_3y`, `avg_5y`
+
+---
+
+## ★ 指标计算框架（Strategy Pattern）
+
+本项目提供了一套可扩展的指标计算框架，基于策略模式 (Strategy Pattern)，
+方便后续添加更复杂的量化指标。
+
+### 架构概览
+
+```
+DataReader（数据读取接口）
+    ↓
+BaseIndicator（指标基类）
+    ↓
+IndicatorRegistry（注册表，统一发现和调用）
+```
+
+### 内置指标
+
+| 指标名 | 说明 |
+|---|---|
+| pe_percentile | 历史 PE-TTM 百分位 |
+| pb_percentile | 历史 PB 百分位 |
+| dv_percentile | 历史股息率百分位 |
+
+### 自定义新指标
+
+继承 `BaseIndicator` 并用 `@IndicatorRegistry.register` 装饰即可：
+
+```python
+from analyzers.indicator_framework import BaseIndicator, IndicatorRegistry
+
+@IndicatorRegistry.register
+class MyCustomIndicator(BaseIndicator):
+    name = "my_indicator"
+    description = "我的自定义指标"
+
+    def compute(self, ts_code, **kwargs):
+        df = self.reader.read_daily_market(ts_code, fields=["pe_ttm", "pb"])
+        # ... 计算逻辑 ...
+        return {"result": 42}
+```
+
+### 调用方式
+
+```python
+# Python 代码
+from analyzers.indicator_framework import IndicatorRegistry
+registry = IndicatorRegistry(db_session)
+result = registry.compute("pe_percentile", ts_code="000001.SZ", years=5)
+
+# API 调用
+# GET /api/core/stocks/000001.SZ/indicator/pe_percentile?years=5
+```
+
+### 未来扩展方向
+
+- DCF 模型参数估计器
+- 相对估值通道线计算
+- 宏观经济指标关联计算（M1/M2 与估值的相关性）
+- 技术面指标（MA 均线系统、MACD、RSI、布林带等）
+- 行业横向对比指标
 
 ---
 

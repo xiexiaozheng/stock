@@ -12,8 +12,10 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from collectors.akshare_collector import AkshareCollector
+from collectors.core_collector import CoreCollector
 from collectors.chrome_collector import ChromeCollector
 from models.stock import Stock
+from models.core import StockBasic
 from utils.logger import get_logger
 from config import (
     SCHEDULE_INCREMENTAL_TIME,
@@ -45,6 +47,7 @@ class DataCollector:
     def __init__(self, db: Session):
         self.db = db
         self.akshare = AkshareCollector(db)
+        self.core = CoreCollector(db)
         self.chrome = ChromeCollector()
 
     # ======================== 增量更新 ========================
@@ -52,18 +55,20 @@ class DataCollector:
     def run_incremental_update(self):
         """
         增量更新流程（每日运行）：
-        1. 更新股票列表（检查新股/退市）
+        1. 更新股票列表（旧表 + 新核心表）
         2. 更新最新交易日行情
         3. 更新最新估值数据
         4. 检查并更新财报数据
         5. 更新分红数据
+        6. 更新核心表（日度量价估值 + 季度财务）
         """
         logger.info("=== 开始增量更新 ===")
         _update_status("incremental", "更新股票列表...")
 
         self.akshare.collect_stock_list()
+        self.core.collect_stock_basic()
 
-        # 只更新数据库中已有的股票
+        # 只更新数据库中已有的股票（旧表）
         codes = [r[0] for r in self.db.query(Stock.stock_code).filter(Stock.is_active == True).all()]
         total = len(codes)
         logger.info(f"增量更新 {total} 只股票的行情和估值数据")
@@ -85,6 +90,15 @@ class DataCollector:
         for code in codes:
             self.akshare.collect_financials(code)
 
+        # ---- 核心表增量更新 ----
+        _update_status("incremental", "更新核心表...")
+        core_codes = [r[0] for r in self.db.query(StockBasic.ts_code).filter(StockBasic.is_delist == False).all()]
+        core_total = len(core_codes)
+        for i, ts_code in enumerate(core_codes):
+            if i % 50 == 0:
+                _update_status("incremental", f"核心表进度: {i}/{core_total}")
+            self.core.collect_daily_market_valuation(ts_code)
+
         logger.info("=== 增量更新完成 ===")
 
     # ======================== 全量刷新 ========================
@@ -92,16 +106,18 @@ class DataCollector:
     def run_full_refresh(self, stock_codes: Optional[List[str]] = None):
         """
         全量刷新（首次运行或定期全量）：
-        1. 拉取全市场股票列表
+        1. 拉取全市场股票列表（旧表 + 新核心表）
         2. 拉取所有（或指定）股票近N年日线数据
         3. 拉取财务数据
         4. 拉取估值历史
         5. 拉取分红数据
+        6. 全量填充核心表（日度量价估值 + 季度财务）
         """
         logger.info("=== 开始全量刷新 ===")
         _update_status("full_refresh", "采集股票列表...")
 
         self.akshare.collect_stock_list()
+        self.core.collect_stock_basic()
 
         if stock_codes is None:
             codes = [r[0] for r in self.db.query(Stock.stock_code).filter(Stock.is_active == True).all()]
@@ -125,6 +141,19 @@ class DataCollector:
         # 行业板块
         _update_status("full_refresh", "采集行业板块数据...")
         self.akshare.collect_industries()
+
+        # ---- 核心表全量刷新 ----
+        _update_status("full_refresh", "全量填充核心表...")
+        core_codes = [r[0] for r in self.db.query(StockBasic.ts_code).filter(StockBasic.is_delist == False).all()]
+        core_total = len(core_codes)
+
+        for i, ts_code in enumerate(core_codes):
+            if i % 20 == 0:
+                _update_status("full_refresh", f"核心表进度: {i}/{core_total}，当前: {ts_code}")
+                logger.info(f"核心表全量刷新进度: {i}/{core_total}，股票: {ts_code}")
+
+            self.core.collect_daily_market_valuation(ts_code, force_full=True)
+            self.core.collect_quarterly_finance(ts_code)
 
         logger.info("=== 全量刷新完成 ===")
 
