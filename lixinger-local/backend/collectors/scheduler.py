@@ -205,10 +205,13 @@ def run_task_async(task_type: str = "incremental", stock_codes: Optional[List[st
             logger.error(f"采集任务异常: {e}", exc_info=True)
             _task_status["last_error"] = str(e)
         finally:
-            if collector:
-                collector.close()
             _task_status["is_running"] = False
             _task_status["progress"] = "已完成"
+            try:
+                if collector:
+                    collector.close()
+            except Exception as e:
+                logger.warning(f"DataCollector close 异常: {e}")
             db.close()
 
     t = threading.Thread(target=_run, daemon=True)

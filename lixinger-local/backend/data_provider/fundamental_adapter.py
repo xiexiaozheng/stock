@@ -225,14 +225,33 @@ class FundamentalAdapter:
         except Exception as e:
             logger.debug(f"[FundamentalAdapter] 业绩预告接口失败: {e}")
 
-        # 候选2: 利润表同比
+        # 候选2: 利润表同比 (暂未实现完整的年度同比计算)
         if not growth:
             try:
                 time.sleep(1)
                 df = ak.stock_profit_sheet_by_yearly_em(symbol=stock_code)
-                if df is not None and not df.empty:
-                    # 取最新两年计算同比
-                    pass  # 复杂计算，暂留空
+                if df is not None and not df.empty and len(df) >= 2:
+                    # 简化同比: 取最近两年净利润比较
+                    rev_col = None
+                    for c in ("营业总收入", "营业收入", "total_revenue"):
+                        if c in df.columns:
+                            rev_col = c
+                            break
+                    profit_col = None
+                    for c in ("净利润", "归属于母公司所有者的净利润", "net_profit"):
+                        if c in df.columns:
+                            profit_col = c
+                            break
+                    if rev_col:
+                        r0 = safe_float(df.iloc[0].get(rev_col))
+                        r1 = safe_float(df.iloc[1].get(rev_col))
+                        if r0 and r1 and r1 != 0:
+                            growth["yoy_sales_growth"] = round((r0 - r1) / abs(r1) * 100, 2)
+                    if profit_col:
+                        p0 = safe_float(df.iloc[0].get(profit_col))
+                        p1 = safe_float(df.iloc[1].get(profit_col))
+                        if p0 and p1 and p1 != 0:
+                            growth["yoy_profit_growth"] = round((p0 - p1) / abs(p1) * 100, 2)
             except Exception as e:
                 logger.debug(f"[FundamentalAdapter] 利润表接口失败: {e}")
 

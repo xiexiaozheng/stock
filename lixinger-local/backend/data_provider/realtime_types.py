@@ -331,27 +331,43 @@ class CircuitBreaker:
 
 
 # =====================================================================
-# 全局熔断器实例
+# 全局熔断器实例 — 使用配置值
 # =====================================================================
 
-# 实时行情熔断器: 3次失败，5分钟冷却
+def _get_cb_threshold() -> int:
+    try:
+        from config import CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        return CIRCUIT_BREAKER_FAILURE_THRESHOLD
+    except ImportError:
+        return 3
+
+
+def _get_cb_cooldown() -> float:
+    try:
+        from config import CIRCUIT_BREAKER_COOLDOWN_SECONDS
+        return CIRCUIT_BREAKER_COOLDOWN_SECONDS
+    except ImportError:
+        return 300.0
+
+
+# 实时行情熔断器
 _realtime_circuit_breaker = CircuitBreaker(
-    failure_threshold=3,
-    cooldown_seconds=300.0,
+    failure_threshold=_get_cb_threshold(),
+    cooldown_seconds=_get_cb_cooldown(),
     half_open_max_calls=1,
 )
 
-# 筹码分布熔断器: 2次失败，10分钟冷却（更保守）
+# 筹码分布熔断器 (更保守: 阈值更低, 冷却更长)
 _chip_circuit_breaker = CircuitBreaker(
-    failure_threshold=2,
-    cooldown_seconds=600.0,
+    failure_threshold=max(1, _get_cb_threshold() - 1),
+    cooldown_seconds=_get_cb_cooldown() * 2,
     half_open_max_calls=1,
 )
 
-# 日K线熔断器: 3次失败，5分钟冷却
+# 日K线熔断器
 _daily_circuit_breaker = CircuitBreaker(
-    failure_threshold=3,
-    cooldown_seconds=300.0,
+    failure_threshold=_get_cb_threshold(),
+    cooldown_seconds=_get_cb_cooldown(),
     half_open_max_calls=1,
 )
 

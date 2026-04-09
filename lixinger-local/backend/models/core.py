@@ -104,7 +104,7 @@ class DailyMarketValuation(Base):
     adj_factor = Column(
         Float,
         nullable=True,
-        comment="后复权因子，复权价 = close × adj_factor。注意：当前未自动填充，需额外数据源或后续计算",
+        comment="后复权因子，复权价 = close × adj_factor。可通过 BaostockFetcher.get_adjust_factor() 获取并填充",
     )
     turnover_rate = Column(
         Float,
@@ -192,7 +192,7 @@ class QuarterlyFinance(Base):
     ann_date = Column(
         Date,
         nullable=True,
-        comment="实际公告日期，用于回测时防范前视偏差。注意：当前未自动填充，回测时需确认数据可用性",
+        comment="实际公告日期，用于回测时防范前视偏差。可通过 TushareFetcher (需 Token) 的 pro.disclosure_date() 获取",
     )
 
     # ------ 利润表核心 ------

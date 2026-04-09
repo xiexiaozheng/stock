@@ -356,7 +356,7 @@ class DataFetcherManager:
             from data_provider.efinance_fetcher import EfinanceFetcher
             ef = EfinanceFetcher()
             if tushare_token:
-                ef.priority = 1  # 有 Tushare Token 时降低优先级
+                ef.priority = 1  # 有 Tushare Token 时降低优先级 (数值越大优先级越低)
             self.register_fetcher(ef)
             logger.info(f"[DataFetcherManager] 注册 EfinanceFetcher (priority={ef.priority})")
         except ImportError as e:

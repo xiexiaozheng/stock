@@ -95,10 +95,10 @@ class TushareFetcher(BaseFetcher):
         with self._rate_lock:
             current_minute = int(time.time() / 60)
 
-            # 清理旧的计数器
+            # 清理旧的计数器 (只保留当前分钟)
             expired = [
                 m for m in self._call_count_per_minute
-                if m < current_minute - 1
+                if m < current_minute
             ]
             for m in expired:
                 del self._call_count_per_minute[m]
