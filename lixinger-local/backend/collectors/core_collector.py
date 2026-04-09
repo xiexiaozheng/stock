@@ -1,15 +1,18 @@
 """
-核心数据采集模块
+核心数据采集模块 — 多数据源版
 
-负责从 akshare 获取数据并写入三张核心表：
+负责从多个数据源获取数据并写入三张核心表：
 1. StockBasic - 股票基础信息
 2. DailyMarketValuation - 日度量价与估值
 3. QuarterlyFinance - 季度财务核心
 
-参考 ZhuLinsen/daily_stock_analysis 的数据获取逻辑，
-支持增量更新和全量更新两种模式。
+参考 ZhuLinsen/daily_stock_analysis 的多信源数据获取架构：
+- 日K线行情: 通过 DataFetcherManager 自动 failover (efinance → akshare → tushare → baostock)
+- 估值指标: 通过 api_compat.call_akshare() 兼容层
+- 后复权因子: 通过 BaostockFetcher 专有接口
+- 财务数据: 通过 api_compat.call_akshare() + FundamentalAdapter 补充
 
-所有接口调用通过 api_compat.call_akshare() 统一入口。
+所有数据源接口都有独立的防封禁策略 (限流、熔断器、UA轮换、重试)。
 """
 import logging
 import time
@@ -25,6 +28,10 @@ from models.core import StockBasic, DailyMarketValuation, QuarterlyFinance
 from utils.api_compat import call_akshare, AkshareAPIError
 from utils.logger import get_logger
 from config import HISTORY_YEARS_QUOTES, HISTORY_YEARS_FINANCIALS, HISTORY_YEARS_VALUATIONS
+
+# 多数据源框架
+from data_provider.base import DataFetcherManager, DataFetchError, normalize_stock_code
+from data_provider.realtime_types import safe_float as dp_safe_float
 
 logger = get_logger(__name__)
 
@@ -81,10 +88,36 @@ def _ts_code_to_pure(ts_code: str) -> str:
 
 class CoreCollector(BaseCollector):
     """
-    核心数据采集器
+    核心数据采集器 — 多数据源版
 
     负责采集三张核心表的数据，支持增量和全量更新。
+    日K线行情通过 DataFetcherManager 多数据源自动 failover 获取。
+    估值、财务数据通过 api_compat + FundamentalAdapter 多接口探测获取。
     """
+
+    def __init__(self, db: Session, manager: Optional[DataFetcherManager] = None):
+        super().__init__(db)
+        # 注入或自动创建 DataFetcherManager
+        self._manager = manager
+        self._owns_manager = False  # 是否由本类创建（需在 close 时释放）
+
+    @property
+    def manager(self) -> DataFetcherManager:
+        """延迟初始化 DataFetcherManager"""
+        if self._manager is None:
+            self._manager = DataFetcherManager()
+            self._owns_manager = True
+            logger.info(
+                f"CoreCollector 自动创建 DataFetcherManager, "
+                f"已注册 {len(self._manager.get_fetchers())} 个数据源"
+            )
+        return self._manager
+
+    def close(self):
+        """释放资源"""
+        if self._owns_manager and self._manager is not None:
+            self._manager.close()
+            self._manager = None
 
     # ======================== 股票基础信息 ========================
 
@@ -92,32 +125,60 @@ class CoreCollector(BaseCollector):
         """
         采集全市场 A 股基础信息，写入 stock_basic 表。
 
-        数据源: akshare stock_list
+        多数据源策略:
+        1. 优先通过 DataFetcherManager 获取 (efinance/akshare/tushare/baostock)
+        2. 失败则 fallback 到 api_compat.call_akshare()
+
         更新策略: 全量 upsert
         """
-        logger.info("开始采集 A 股基础信息到 stock_basic...")
+        logger.info("开始采集 A 股基础信息到 stock_basic (多数据源)...")
+
+        df = None
+        source = "unknown"
+
+        # 策略1: 通过 DataFetcherManager 获取股票列表
         try:
-            df = call_akshare("stock_list")
-        except AkshareAPIError as e:
-            logger.error(f"股票列表采集失败: {e}")
+            df = self.manager.get_stock_list()
+            if df is not None and not df.empty:
+                source = "DataFetcherManager"
+                logger.info(f"股票列表来自 DataFetcherManager, {len(df)} 条")
+        except Exception as e:
+            logger.warning(f"DataFetcherManager 股票列表失败: {e}")
+
+        # 策略2: 通过 api_compat fallback
+        if df is None or df.empty:
+            try:
+                df = call_akshare("stock_list")
+                source = "api_compat"
+                logger.info(f"股票列表来自 api_compat, {len(df)} 条")
+            except AkshareAPIError as e:
+                logger.error(f"股票列表采集全部失败: {e}")
+                return 0
+
+        if df is None or df.empty:
+            logger.warning("stock_basic 采集结果为空")
             return 0
 
         rows = []
         for _, row in df.iterrows():
-            code = str(row.get("code", row.get("股票代码", ""))).strip().zfill(6)
-            name = str(row.get("name", row.get("股票名称", ""))).strip()
+            code = str(
+                row.get("code", row.get("股票代码", row.get("symbol", "")))
+            ).strip().zfill(6)
+            name = str(
+                row.get("name", row.get("股票名称", row.get("stock_name", "")))
+            ).strip()
             if not code or not name:
                 continue
             rows.append({
                 "ts_code": _infer_ts_code(code),
                 "name": name,
-                "industry": None,  # 行业信息后续由行业采集补充
+                "industry": str(row.get("industry", "")) or None,
                 "is_delist": False,
             })
 
         if rows:
             self._upsert(StockBasic, rows, ["ts_code"])
-            logger.info(f"stock_basic 写入/更新 {len(rows)} 条")
+            logger.info(f"stock_basic 写入/更新 {len(rows)} 条 (来源: {source})")
             return len(rows)
         logger.warning("stock_basic 采集结果为空")
         return 0
@@ -134,14 +195,17 @@ class CoreCollector(BaseCollector):
         """
         采集日度量价与估值数据，写入 daily_market_valuation 表。
 
-        数据采集策略（借鉴 daily_stock_analysis 的增量逻辑）：
-        1. 增量模式：查询已有最新日期，只拉取之后的增量数据
-        2. 全量模式：force_full=True 时忽略已有数据，全量拉取
+        多数据源策略（参考 daily_stock_analysis 架构）:
+        1. 日K线行情: DataFetcherManager 自动 failover
+           (efinance → akshare → tushare → baostock)
+        2. 估值指标: api_compat (stock_a_indicator_lg)
+        3. 后复权因子: BaostockFetcher.get_adjust_factor() (独有)
 
-        数据合并：
-        - 日K线行情（close, 换手率 from stock_zh_a_hist）
-        - 估值指标（pe_ttm, pb, ps_ttm, 市值, 股息率 from stock_a_indicator_lg）
-        两者按 trade_date 合并写入同一条记录。
+        数据合并:
+        - 日K线行情 (close, volume, turnover_rate from 多数据源)
+        - 估值指标 (pe_ttm, pb, ps_ttm, 市值, 股息率 from akshare)
+        - 后复权因子 (adj_factor from baostock)
+        三者按 trade_date 合并写入同一条记录。
 
         :param ts_code: 带后缀的股票代码（如 000001.SZ）
         :param start_date: 开始日期 YYYYMMDD
@@ -177,39 +241,67 @@ class CoreCollector(BaseCollector):
                     return 0
                 start_date = incremental_start
 
-        # ---- 采集日K线行情 ----
-        self._rate_limit(0.5, 1.0)
+        # 转换日期格式 YYYYMMDD → YYYY-MM-DD (DataFetcherManager 使用)
+        start_dash = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+        end_dash = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+
+        # ---- 数据源1: 日K线行情（多数据源 failover）----
         quotes_data = {}
+        data_source = "none"
         try:
-            df_quotes = call_akshare(
-                "daily_quotes",
-                symbol=pure_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="",  # 不复权，原始价格
+            df_quotes, data_source = self.manager.get_daily_data(
+                pure_code,
+                start_date=start_dash,
+                end_date=end_dash,
+                days=0,  # 不限天数，用日期范围控制
             )
             if df_quotes is not None and not df_quotes.empty:
-                col_map = {
-                    "日期": "trade_date", "date": "trade_date",
-                    "收盘": "close", "close": "close",
-                    "换手率": "turnover_rate", "turnover_rate": "turnover_rate",
-                }
-                df_quotes = df_quotes.rename(
-                    columns={k: v for k, v in col_map.items() if k in df_quotes.columns}
+                logger.info(
+                    f"{ts_code} 日K线来自 {data_source}, {len(df_quotes)} 行"
                 )
                 for _, row in df_quotes.iterrows():
-                    td = _safe_date(row.get("trade_date"))
+                    td = _safe_date(row.get("date"))
                     if td is None:
                         continue
                     quotes_data[td] = {
                         "close": _safe_float(row.get("close")),
                         "turnover_rate": _safe_float(row.get("turnover_rate")),
                     }
-        except AkshareAPIError as e:
-            logger.warning(f"{ts_code} 日K线行情采集失败: {e}")
+        except DataFetchError as e:
+            logger.warning(f"{ts_code} 日K线多数据源全部失败: {e}")
+            # Fallback: 直接调用 api_compat (最后的保险)
+            self._rate_limit(0.5, 1.0)
+            try:
+                df_quotes = call_akshare(
+                    "daily_quotes",
+                    symbol=pure_code,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="",
+                )
+                if df_quotes is not None and not df_quotes.empty:
+                    data_source = "api_compat_fallback"
+                    col_map = {
+                        "日期": "trade_date", "date": "trade_date",
+                        "收盘": "close", "close": "close",
+                        "换手率": "turnover_rate", "turnover_rate": "turnover_rate",
+                    }
+                    df_quotes = df_quotes.rename(
+                        columns={k: v for k, v in col_map.items() if k in df_quotes.columns}
+                    )
+                    for _, row in df_quotes.iterrows():
+                        td = _safe_date(row.get("trade_date"))
+                        if td is None:
+                            continue
+                        quotes_data[td] = {
+                            "close": _safe_float(row.get("close")),
+                            "turnover_rate": _safe_float(row.get("turnover_rate")),
+                        }
+            except AkshareAPIError as e2:
+                logger.warning(f"{ts_code} api_compat fallback 也失败: {e2}")
 
-        # ---- 采集估值指标 ----
+        # ---- 数据源2: 估值指标 (akshare stock_a_indicator_lg) ----
         self._rate_limit(0.5, 1.0)
         valuation_data = {}
         try:
@@ -242,9 +334,38 @@ class CoreCollector(BaseCollector):
         except AkshareAPIError as e:
             logger.warning(f"{ts_code} 估值指标采集失败: {e}")
 
-        # ---- 合并行情 + 估值数据 ----
+        # ---- 数据源3: 后复权因子 (BaostockFetcher 独有) ----
+        adj_factor_data = {}
+        try:
+            from data_provider.baostock_fetcher import BaostockFetcher
+            bs_fetcher = None
+            # 从 manager 中找已注册的 BaostockFetcher
+            for f in self.manager.get_fetchers():
+                if isinstance(f, BaostockFetcher):
+                    bs_fetcher = f
+                    break
+            if bs_fetcher is None:
+                bs_fetcher = BaostockFetcher()
+
+            adj_df = bs_fetcher.get_adjust_factor(
+                pure_code,
+                start_date=start_dash,
+                end_date=end_dash,
+            )
+            if adj_df is not None and not adj_df.empty:
+                logger.info(f"{ts_code} 后复权因子来自 BaostockFetcher, {len(adj_df)} 行")
+                for _, row in adj_df.iterrows():
+                    td = _safe_date(row.get("dividOperateDate", row.get("date")))
+                    if td is None:
+                        continue
+                    adj_factor_data[td] = _safe_float(
+                        row.get("backAdjustFactor", row.get("foreAdjustFactor"))
+                    )
+        except Exception as e:
+            logger.debug(f"{ts_code} 后复权因子获取失败 (非必须): {e}")
+
+        # ---- 合并: 行情 + 估值 + 复权因子 ----
         all_dates = set(quotes_data.keys()) | set(valuation_data.keys())
-        # 过滤日期范围
         start_dt = datetime.strptime(start_date, "%Y%m%d").date()
         end_dt = datetime.strptime(end_date, "%Y%m%d").date()
         all_dates = {d for d in all_dates if start_dt <= d <= end_dt}
@@ -257,7 +378,7 @@ class CoreCollector(BaseCollector):
                 "ts_code": ts_code,
                 "trade_date": td,
                 "close": q.get("close"),
-                "adj_factor": None,  # 复权因子需额外数据源或后续计算
+                "adj_factor": adj_factor_data.get(td),  # 从 baostock 填充
                 "turnover_rate": q.get("turnover_rate"),
                 "total_mv": v.get("total_mv"),
                 "pe_ttm": v.get("pe_ttm"),
@@ -269,7 +390,11 @@ class CoreCollector(BaseCollector):
 
         if rows:
             self._upsert(DailyMarketValuation, rows, ["ts_code", "trade_date"])
-        logger.debug(f"{ts_code} daily_market_valuation 写入 {len(rows)} 条")
+        logger.debug(
+            f"{ts_code} daily_market_valuation 写入 {len(rows)} 条 "
+            f"(行情: {data_source}, 估值: akshare, "
+            f"复权: {'baostock' if adj_factor_data else 'N/A'})"
+        )
         return len(rows)
 
     # ======================== 季度财务核心 ========================
@@ -278,21 +403,21 @@ class CoreCollector(BaseCollector):
         """
         采集季度财务核心数据，写入 quarterly_finance 表。
 
-        数据整合逻辑（借鉴 daily_stock_analysis 的 fundamental_adapter 模式）：
-        1. 从利润表采集 total_revenue, net_profit, net_profit_deduct
-        2. 从现金流量表采集 net_cash_flows_oper
-        3. 从衍生指标计算或采集 roe, gross_margin, liability_to_asset
+        多数据源策略（参考 daily_stock_analysis fundamental_adapter 模式）:
+        1. 主数据源: api_compat 获取利润表/资产负债表/现金流量表
+        2. 补充源: FundamentalAdapter fail-open 模式补充增长/盈利指标
+        3. 将 ROE、毛利率、资产负债率等衍生指标直接计算或从多源合并
 
         :param ts_code: 带后缀的股票代码
         :return: 写入行数
         """
-        logger.info(f"采集 {ts_code} 季度财务数据到 quarterly_finance...")
+        logger.info(f"采集 {ts_code} 季度财务数据到 quarterly_finance (多数据源)...")
         pure_code = _ts_code_to_pure(ts_code)
 
         # 数据缓存 {end_date_str: {fields...}}
         data_map: Dict[str, Dict] = {}
 
-        # ---- 采集利润表 ----
+        # ---- 主数据源1: 利润表 ----
         self._rate_limit()
         try:
             df = call_akshare("financial_income", symbol=pure_code)
@@ -328,7 +453,7 @@ class CoreCollector(BaseCollector):
         except AkshareAPIError as e:
             logger.warning(f"{ts_code} 利润表采集失败: {e}")
 
-        # ---- 采集资产负债表（用于资产负债率和ROE） ----
+        # ---- 主数据源2: 资产负债表（用于资产负债率和ROE）----
         self._rate_limit()
         try:
             df = call_akshare("financial_balance", symbol=pure_code)
@@ -365,7 +490,7 @@ class CoreCollector(BaseCollector):
         except AkshareAPIError as e:
             logger.warning(f"{ts_code} 资产负债表采集失败: {e}")
 
-        # ---- 采集现金流量表 ----
+        # ---- 主数据源3: 现金流量表 ----
         self._rate_limit()
         try:
             df = call_akshare("financial_cashflow", symbol=pure_code)
@@ -386,6 +511,34 @@ class CoreCollector(BaseCollector):
         except AkshareAPIError as e:
             logger.warning(f"{ts_code} 现金流量表采集失败: {e}")
 
+        # ---- 补充数据源: FundamentalAdapter (fail-open) ----
+        try:
+            from data_provider.fundamental_adapter import FundamentalAdapter
+            adapter = FundamentalAdapter()
+            bundle = adapter.get_fundamental_bundle(pure_code, budget_seconds=5.0)
+            if bundle.get("status") in ("ok", "partial"):
+                # 将 FundamentalAdapter 的数据补充到最新报告期
+                # 找最新的 end_date
+                if data_map:
+                    latest_end = max(data_map.keys())
+                    entry = data_map[latest_end]
+
+                    # 补充 ROE (如果主数据源未计算出)
+                    earnings = bundle.get("earnings", {})
+                    if entry.get("roe") is None and earnings.get("return_on_equity"):
+                        entry["roe"] = _safe_float(earnings["return_on_equity"])
+                        logger.debug(
+                            f"{ts_code} ROE 由 FundamentalAdapter 补充: "
+                            f"{entry['roe']}"
+                        )
+
+                logger.info(
+                    f"{ts_code} FundamentalAdapter 补充状态: {bundle['status']}, "
+                    f"来源链: {[s['provider'] for s in bundle.get('source_chain', [])]}"
+                )
+        except Exception as e:
+            logger.debug(f"{ts_code} FundamentalAdapter 补充数据失败 (非必须): {e}")
+
         # ---- 组装行并写入 ----
         rows = []
         for end_date_str, fields in data_map.items():
@@ -395,7 +548,7 @@ class CoreCollector(BaseCollector):
             rows.append({
                 "ts_code": ts_code,
                 "end_date": ed,
-                "ann_date": None,  # 公告日期需额外数据源
+                "ann_date": None,  # 公告日期需 Tushare Token
                 "total_revenue": fields.get("total_revenue"),
                 "net_profit": fields.get("net_profit"),
                 "net_profit_deduct": fields.get("net_profit_deduct"),

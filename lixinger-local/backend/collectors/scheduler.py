@@ -3,6 +3,10 @@
 
 统一管理全量刷新和增量更新的调度逻辑。
 支持手动触发和定时调度（APScheduler）。
+
+DataFetcherManager 生命周期由 DataCollector 管理：
+  - 在 DataCollector 初始化时创建
+  - 在采集任务结束时关闭
 """
 import logging
 import threading
@@ -21,6 +25,9 @@ from config import (
     SCHEDULE_INCREMENTAL_TIME,
     HISTORY_YEARS_QUOTES,
 )
+
+# 多数据源框架
+from data_provider.base import DataFetcherManager
 
 logger = get_logger(__name__)
 
@@ -42,13 +49,25 @@ def get_task_status() -> dict:
 
 
 class DataCollector:
-    """统一数据采集调度器"""
+    """统一数据采集调度器（多数据源版）"""
 
     def __init__(self, db: Session):
         self.db = db
         self.akshare = AkshareCollector(db)
-        self.core = CoreCollector(db)
         self.chrome = ChromeCollector()
+        # 创建共享的 DataFetcherManager，注入到 CoreCollector
+        self._manager = DataFetcherManager()
+        self.core = CoreCollector(db, manager=self._manager)
+        logger.info(
+            f"DataCollector 初始化完成, "
+            f"已注册 {len(self._manager.get_fetchers())} 个数据源"
+        )
+
+    def close(self):
+        """释放资源"""
+        if self._manager:
+            self._manager.close()
+            self._manager = None
 
     # ======================== 增量更新 ========================
 
@@ -174,6 +193,7 @@ def run_task_async(task_type: str = "incremental", stock_codes: Optional[List[st
 
     def _run():
         db = SessionLocal()
+        collector = None
         try:
             collector = DataCollector(db)
             if task_type == "full_refresh":
@@ -185,6 +205,8 @@ def run_task_async(task_type: str = "incremental", stock_codes: Optional[List[st
             logger.error(f"采集任务异常: {e}", exc_info=True)
             _task_status["last_error"] = str(e)
         finally:
+            if collector:
+                collector.close()
             _task_status["is_running"] = False
             _task_status["progress"] = "已完成"
             db.close()
