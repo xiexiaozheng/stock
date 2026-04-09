@@ -203,9 +203,10 @@ class BaseFetcher(ABC):
 
         # 按日期范围截取
         if not with_indicators.empty and "date" in with_indicators.columns:
-            with_indicators = with_indicators[
-                with_indicators["date"] >= start_date
-            ].tail(days if days else len(with_indicators))
+            filtered = with_indicators[with_indicators["date"] >= start_date]
+            if days and days > 0:
+                filtered = filtered.tail(days)
+            with_indicators = filtered
 
         return with_indicators
 
