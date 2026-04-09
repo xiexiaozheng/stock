@@ -420,7 +420,7 @@ class CoreCollector(BaseCollector):
         # ---- 主数据源1: 利润表 ----
         self._rate_limit()
         try:
-            df = call_akshare("financial_income", symbol=pure_code)
+            df = call_akshare("financial_income", stock=pure_code)
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
                     end_date_str = self._extract_report_date(row)
@@ -456,7 +456,7 @@ class CoreCollector(BaseCollector):
         # ---- 主数据源2: 资产负债表（用于资产负债率和ROE）----
         self._rate_limit()
         try:
-            df = call_akshare("financial_balance", symbol=pure_code)
+            df = call_akshare("financial_balance", stock=pure_code)
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
                     end_date_str = self._extract_report_date(row)
@@ -493,7 +493,7 @@ class CoreCollector(BaseCollector):
         # ---- 主数据源3: 现金流量表 ----
         self._rate_limit()
         try:
-            df = call_akshare("financial_cashflow", symbol=pure_code)
+            df = call_akshare("financial_cashflow", stock=pure_code)
             if df is not None and not df.empty:
                 for _, row in df.iterrows():
                     end_date_str = self._extract_report_date(row)

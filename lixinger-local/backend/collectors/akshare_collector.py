@@ -217,10 +217,7 @@ class AkshareCollector(BaseCollector):
         """采集利润表"""
         self._rate_limit()
         try:
-            # [需验证] 参数格式因版本而异
-            # 备选1: ak.stock_financial_report_sina(stock=stock_code, symbol="income")
-            # 备选2: ak.stock_profit_sheet_by_yearly_em(symbol=stock_code)
-            df = call_akshare("financial_income", symbol=stock_code)
+            df = call_akshare("financial_income", stock=stock_code)
         except AkshareAPIError as e:
             logger.warning(f"{stock_code} 利润表采集失败: {e}")
             return
@@ -248,7 +245,7 @@ class AkshareCollector(BaseCollector):
         """采集资产负债表"""
         self._rate_limit()
         try:
-            df = call_akshare("financial_balance", symbol=stock_code)
+            df = call_akshare("financial_balance", stock=stock_code)
         except AkshareAPIError as e:
             logger.warning(f"{stock_code} 资产负债表采集失败: {e}")
             return
@@ -270,7 +267,7 @@ class AkshareCollector(BaseCollector):
         """采集现金流量表"""
         self._rate_limit()
         try:
-            df = call_akshare("financial_cashflow", symbol=stock_code)
+            df = call_akshare("financial_cashflow", stock=stock_code)
         except AkshareAPIError as e:
             logger.warning(f"{stock_code} 现金流量表采集失败: {e}")
             return

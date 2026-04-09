@@ -32,26 +32,28 @@ AKSHARE_API_MAP = {
     "financial_income": {
         "primary": "ak.stock_financial_report_sina",
         "fallbacks": [
-            "ak.stock_financial_abstract_sina",
+            "ak.stock_profit_sheet_by_yearly_em",
         ],
         "description": "获取利润表",
-        "params": {"symbol": None, "symbol_type": "income"},  # [需验证] symbol_type 参数名可能为 report
+        # stock_financial_report_sina(stock=股票代码, symbol="income")
+        # stock 由调用方通过 stock= 关键字传入，这里只配置固定参数
+        "params": {"symbol": "income"},
     },
     "financial_balance": {
         "primary": "ak.stock_financial_report_sina",
         "fallbacks": [
-            "ak.stock_financial_abstract_sina",
+            "ak.stock_balance_sheet_by_yearly_em",
         ],
         "description": "获取资产负债表",
-        "params": {"symbol": None, "symbol_type": "balance"},  # [需验证]
+        "params": {"symbol": "balance"},
     },
     "financial_cashflow": {
         "primary": "ak.stock_financial_report_sina",
         "fallbacks": [
-            "ak.stock_financial_abstract_sina",
+            "ak.stock_cash_flow_sheet_by_yearly_em",
         ],
         "description": "获取现金流量表",
-        "params": {"symbol": None, "symbol_type": "cash_flow"},  # [需验证]
+        "params": {"symbol": "cash_flow"},
     },
     "valuation_indicator": {
         "primary": "ak.stock_a_indicator_lg",
@@ -121,7 +123,12 @@ def call_akshare(api_key: str, **kwargs) -> Any:
     for api_path in api_candidates:
         try:
             func = _resolve_function(ak, api_path)
-            result = func(**merged_kwargs)
+            # EM 接口的股票代码参数名为 symbol，而 sina 接口为 stock；
+            # 当调用 EM fallback 时自动将 stock 参数重命名为 symbol
+            call_kwargs = dict(merged_kwargs)
+            if "_em" in api_path and "stock" in call_kwargs:
+                call_kwargs["symbol"] = call_kwargs.pop("stock")
+            result = func(**call_kwargs)
             logger.debug(f"akshare 接口 {api_path} 调用成功")
             return result
         except AttributeError as e:
