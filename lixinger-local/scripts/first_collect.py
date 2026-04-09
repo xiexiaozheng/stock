@@ -54,7 +54,7 @@ def main():
                 ts_codes = [
                     r[0]
                     for r in db.query(StockBasic.ts_code)
-                    .filter(StockBasic.is_delist == False)
+                    .filter(StockBasic.is_delist.is_(False))
                     .all()
                 ]
 

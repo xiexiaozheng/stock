@@ -45,7 +45,7 @@ def list_stock_basic(
     query = db.query(StockBasic)
 
     if not include_delisted:
-        query = query.filter(StockBasic.is_delist == False)
+        query = query.filter(StockBasic.is_delist.is_(False))
     if q:
         query = query.filter(
             (StockBasic.ts_code.contains(q)) | (StockBasic.name.contains(q))

@@ -8,7 +8,9 @@
 
 设计原则：
 - 遵循 PEP8 规范
-- 金额和比率字段使用 Float 以保证精度和兼容性
+- 金额和比率字段使用 Float 类型：虽然 Float 存在浮点精度限制，
+  但选择 Float 是为了与 pandas/numpy 生态无缝兼容（DataFrame 操作），
+  在量化分析场景中精度完全满足要求（PE/PB/ROE 等指标通常仅保留 2-4 位小数）
 - 每个字段添加详细中文注释说明含义
 - 联合主键 + 联合索引优化查询性能
 """
@@ -102,7 +104,7 @@ class DailyMarketValuation(Base):
     adj_factor = Column(
         Float,
         nullable=True,
-        comment="后复权因子，复权价 = close × adj_factor",
+        comment="后复权因子，复权价 = close × adj_factor。注意：当前未自动填充，需额外数据源或后续计算",
     )
     turnover_rate = Column(
         Float,
@@ -190,7 +192,7 @@ class QuarterlyFinance(Base):
     ann_date = Column(
         Date,
         nullable=True,
-        comment="实际公告日期，用于回测时防范前视偏差（look-ahead bias）",
+        comment="实际公告日期，用于回测时防范前视偏差。注意：当前未自动填充，回测时需确认数据可用性",
     )
 
     # ------ 利润表核心 ------

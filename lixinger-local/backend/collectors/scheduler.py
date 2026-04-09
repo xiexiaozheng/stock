@@ -92,7 +92,7 @@ class DataCollector:
 
         # ---- 核心表增量更新 ----
         _update_status("incremental", "更新核心表...")
-        core_codes = [r[0] for r in self.db.query(StockBasic.ts_code).filter(StockBasic.is_delist == False).all()]
+        core_codes = [r[0] for r in self.db.query(StockBasic.ts_code).filter(StockBasic.is_delist.is_(False)).all()]
         core_total = len(core_codes)
         for i, ts_code in enumerate(core_codes):
             if i % 50 == 0:
@@ -144,7 +144,7 @@ class DataCollector:
 
         # ---- 核心表全量刷新 ----
         _update_status("full_refresh", "全量填充核心表...")
-        core_codes = [r[0] for r in self.db.query(StockBasic.ts_code).filter(StockBasic.is_delist == False).all()]
+        core_codes = [r[0] for r in self.db.query(StockBasic.ts_code).filter(StockBasic.is_delist.is_(False)).all()]
         core_total = len(core_codes)
 
         for i, ts_code in enumerate(core_codes):

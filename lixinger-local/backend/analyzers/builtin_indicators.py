@@ -92,8 +92,9 @@ class PEPercentileIndicator(BaseIndicator):
                 ) if len(pe_series) > 0 else 0.0,
             }
 
-        # 3. 获取当前 PE（最新一条有效数据）
-        current_pe = float(pe_positive.iloc[-1])
+        # 3. 获取当前 PE（最新一条有效数据，按日期排序确保正确性）
+        pe_positive_sorted = pe_positive.sort_index()
+        current_pe = float(pe_positive_sorted.iloc[-1])
 
         # 4. 计算百分位
         pe_values = pe_positive.values
@@ -163,7 +164,7 @@ class PBPercentileIndicator(BaseIndicator):
         if pb_positive.empty:
             return {"ts_code": ts_code, "error": "无有效的正数 PB 数据", "data_points": 0}
 
-        current_pb = float(pb_positive.iloc[-1])
+        current_pb = float(pb_positive.sort_index().iloc[-1])
         pb_values = pb_positive.values
         percentile = float(np.sum(pb_values <= current_pb) / len(pb_values) * 100)
 
@@ -222,7 +223,7 @@ class DividendYieldPercentileIndicator(BaseIndicator):
         if dv_positive.empty:
             return {"ts_code": ts_code, "error": "无有效的正股息率数据", "data_points": 0}
 
-        current_dv = float(dv_positive.iloc[-1])
+        current_dv = float(dv_positive.sort_index().iloc[-1])
         dv_values = dv_positive.values
         percentile = float(np.sum(dv_values <= current_dv) / len(dv_values) * 100)
 

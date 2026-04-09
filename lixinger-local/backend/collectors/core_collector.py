@@ -70,6 +70,7 @@ def _infer_ts_code(code: str) -> str:
         return f"{code}.SZ"
     elif code.startswith(("43", "83", "87", "88")):
         return f"{code}.BJ"
+    logger.warning(f"无法识别股票代码 {code} 的交易所前缀，默认归入 SZ")
     return f"{code}.SZ"
 
 
