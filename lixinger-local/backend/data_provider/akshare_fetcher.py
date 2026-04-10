@@ -2,9 +2,9 @@
 AkshareFetcher — akshare 多数据源 Fetcher (并发多信源版)
 
 数据来源 (akshare 内部支持的所有信源):
-  1. 东方财富: ak.stock_zh_a_hist()         — 日K线 (primary)
-  2. 新浪财经: ak.stock_zh_a_daily()        — 日K线 (fallback)
-  3. 网易/163: ak.stock_zh_a_hist_163()     — 日K线 (if available)
+  1. 东方财富: ak.stock_zh_a_hist()         — 日K线
+  2. 新浪财经: ak.stock_zh_a_daily()        — 日K线
+  3. 腾讯财经: ak.stock_zh_a_hist_tx()      — 日K线
   4. 东方财富: ak.stock_zh_a_spot_em()      — 实时行情
   5. 新浪HTTP: ak.stock_zh_a_spot()         — 实时行情
 
@@ -33,13 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from data_provider.base import (
-    BaseFetcher,
-    DataFetchError,
-    RateLimitError,
-    STANDARD_COLUMNS,
-    normalize_stock_code,
-)
+from data_provider.base import BaseFetcher, STANDARD_COLUMNS, normalize_stock_code
 from data_provider.realtime_types import (
     UnifiedRealtimeQuote,
     RealtimeSource,
@@ -53,6 +47,12 @@ from data_provider.error_classifier import (
     get_adaptive_limiter,
 )
 from data_provider.cross_validator import CrossValidator
+from data_provider.source_config import (
+    get_akshare_api_config,
+    get_cross_validation_config,
+    iter_akshare_sources,
+)
+from utils.api_compat import call_akshare, call_akshare_source
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ class AkshareFetcher(BaseFetcher):
     日K线 — 并发调用所有 akshare 信源:
       1. 东方财富: ak.stock_zh_a_hist()
       2. 新浪财经: ak.stock_zh_a_daily()
-      3. 网易/163: ak.stock_zh_a_hist_163() (if available)
+      3. 腾讯财经: ak.stock_zh_a_hist_tx()
     返回前内部交叉校验。
 
     实时行情 — 并发调用多路源:
@@ -98,16 +98,34 @@ class AkshareFetcher(BaseFetcher):
     """
 
     name = "AkshareFetcher"
-    priority = 1
+    framework_key = "akshare"
 
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
         super().__init__()
         self.sleep_min = sleep_min
         self.sleep_max = sleep_max
-        self._validator = CrossValidator()
+        validation_config = get_cross_validation_config("daily_quotes")
+        tolerances = validation_config.get("tolerances", {})
+        self._validator = CrossValidator(
+            price_tolerance=tolerances.get("close", 0.005),
+            volume_tolerance=tolerances.get("volume", 0.05),
+            pct_chg_tolerance=tolerances.get("pct_chg", 0.01),
+        )
         self._limiter = get_adaptive_limiter(
             "akshare", base_interval=sleep_min, max_interval=30.0
         )
+        self._daily_api_config = get_akshare_api_config("daily_quotes")
+        self._daily_source_specs = list(iter_akshare_sources("daily_quotes"))
+        self._last_source_diagnostic: Dict[str, Any] = {
+            "attempted_sources": [],
+            "successful_sources": [],
+            "failed_sources": [],
+            "failure_reasons": {},
+            "best_source": None,
+            "merged_sources": [],
+            "consistency_score": 0.0,
+            "source_details": {},
+        }
 
     # ---- 防封禁 ----
 
@@ -131,136 +149,65 @@ class AkshareFetcher(BaseFetcher):
         self._set_random_user_agent()
         self._last_request_time = time.time()
 
-    # ---- akshare 信源: 各子接口独立方法 ----
+    def get_last_source_diagnostic(self) -> Dict[str, Any]:
+        return dict(self._last_source_diagnostic)
 
-    def _fetch_eastmoney(
-        self, stock_code: str, sd: str, ed: str
-    ) -> Tuple[str, pd.DataFrame]:
-        """东方财富信源: ak.stock_zh_a_hist()"""
-        source_name = "akshare_eastmoney"
+    def _fetch_daily_source(
+        self,
+        source_config: Dict[str, Any],
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+    ) -> Tuple[str, pd.DataFrame, Dict[str, Any]]:
+        source_name = source_config["source_name"]
+        detail = {
+            "source_name": source_name,
+            "api_function": source_config["api_function"],
+            "doc_reference": source_config.get("doc_reference"),
+            "supports_cross_validation": source_config.get("supports_cross_validation", False),
+            "status": "failed",
+            "failure_reason": None,
+            "error_category": None,
+            "rows": 0,
+            "elapsed": 0.0,
+        }
+        t0 = time.time()
         try:
             self._enforce_rate_limit()
-            import akshare as ak
-            logger.info(f"[AkshareFetcher] 东财信源 stock_zh_a_hist({stock_code})")
-            t0 = time.time()
-            df = ak.stock_zh_a_hist(
+            df = call_akshare_source(
+                "daily_quotes",
+                source_name,
+                raw_exceptions=True,
                 symbol=stock_code,
                 period="daily",
-                start_date=sd,
-                end_date=ed,
+                start_date=start_date,
+                end_date=end_date,
                 adjust="qfq",
+                timeout=source_config.get("timeout"),
             )
-            elapsed = time.time() - t0
-            if df is not None and not df.empty:
-                self._limiter.record_success()
-                logger.info(f"[AkshareFetcher] 东财信源成功: {len(df)} 行, {elapsed:.2f}s")
-                return source_name, df
-        except Exception as e:
-            category = classify_error(e)
-            if category == ErrorCategory.API_SYNTAX:
-                logger.error(f"[AkshareFetcher] 东财信源 API 语法错误: {e}")
-            elif category == ErrorCategory.ANTI_CRAWL:
+            detail["elapsed"] = round(time.time() - t0, 3)
+            if df is None or df.empty:
+                detail["status"] = "empty"
+                detail["failure_reason"] = "empty dataframe"
+                return source_name, pd.DataFrame(), detail
+            self._limiter.record_success()
+            detail["status"] = "ok"
+            detail["rows"] = len(df)
+            return source_name, df, detail
+        except Exception as exc:
+            detail["elapsed"] = round(time.time() - t0, 3)
+            category = classify_error(exc)
+            detail["error_category"] = category.value
+            detail["failure_reason"] = str(exc)
+            if category == ErrorCategory.ANTI_CRAWL:
                 self._limiter.record_anti_crawl()
-                logger.warning(f"[AkshareFetcher] 东财信源反爬虫: {e}")
-            else:
-                logger.warning(f"[AkshareFetcher] 东财信源失败: {e}")
-        return source_name, pd.DataFrame()
-
-    def _fetch_sina(
-        self, stock_code: str, sd: str, ed: str
-    ) -> Tuple[str, pd.DataFrame]:
-        """新浪财经信源: ak.stock_zh_a_daily()"""
-        source_name = "akshare_sina"
-        try:
-            self._enforce_rate_limit()
-            import akshare as ak
-            prefix = "sh" if stock_code.startswith(("6", "9")) else "sz"
-            logger.info(f"[AkshareFetcher] 新浪信源 stock_zh_a_daily({prefix}{stock_code})")
-            t0 = time.time()
-            df = ak.stock_zh_a_daily(
-                symbol=f"{prefix}{stock_code}",
-                start_date=sd,
-                end_date=ed,
-                adjust="qfq",
+            logger.warning(
+                "[AkshareFetcher] 日线信源 %s 调用失败 [%s]: %s",
+                source_name,
+                category.value,
+                exc,
             )
-            elapsed = time.time() - t0
-            if df is not None and not df.empty:
-                self._limiter.record_success()
-                logger.info(f"[AkshareFetcher] 新浪信源成功: {len(df)} 行, {elapsed:.2f}s")
-                return source_name, df
-        except Exception as e:
-            category = classify_error(e)
-            if category == ErrorCategory.API_SYNTAX:
-                logger.error(f"[AkshareFetcher] 新浪信源 API 语法错误: {e}")
-            elif category == ErrorCategory.ANTI_CRAWL:
-                self._limiter.record_anti_crawl()
-                logger.warning(f"[AkshareFetcher] 新浪信源反爬虫: {e}")
-            else:
-                logger.warning(f"[AkshareFetcher] 新浪信源失败: {e}")
-        return source_name, pd.DataFrame()
-
-    def _fetch_163(
-        self, stock_code: str, sd: str, ed: str
-    ) -> Tuple[str, pd.DataFrame]:
-        """网易/163 信源: ak.stock_zh_a_hist_163() (如果存在)"""
-        source_name = "akshare_163"
-        try:
-            self._enforce_rate_limit()
-            import akshare as ak
-            if not hasattr(ak, "stock_zh_a_hist_163"):
-                logger.debug("[AkshareFetcher] 163 信源接口不存在，跳过")
-                return source_name, pd.DataFrame()
-            logger.info(f"[AkshareFetcher] 163信源 stock_zh_a_hist_163({stock_code})")
-            t0 = time.time()
-            df = ak.stock_zh_a_hist_163(
-                symbol=stock_code,
-                start_date=sd,
-                end_date=ed,
-            )
-            elapsed = time.time() - t0
-            if df is not None and not df.empty:
-                self._limiter.record_success()
-                logger.info(f"[AkshareFetcher] 163信源成功: {len(df)} 行, {elapsed:.2f}s")
-                return source_name, df
-        except Exception as e:
-            category = classify_error(e)
-            if category == ErrorCategory.API_SYNTAX:
-                logger.debug(f"[AkshareFetcher] 163信源 API 不兼容: {e}")
-            else:
-                logger.warning(f"[AkshareFetcher] 163信源失败: {e}")
-        return source_name, pd.DataFrame()
-
-    def _fetch_tencent(
-        self, stock_code: str, sd: str, ed: str
-    ) -> Tuple[str, pd.DataFrame]:
-        """腾讯财经信源: ak.stock_zh_a_hist_tx() (如果存在)"""
-        source_name = "akshare_tencent"
-        try:
-            self._enforce_rate_limit()
-            import akshare as ak
-            if not hasattr(ak, "stock_zh_a_hist_tx"):
-                logger.debug("[AkshareFetcher] 腾讯信源接口 stock_zh_a_hist_tx 不存在，跳过")
-                return source_name, pd.DataFrame()
-            # 腾讯接口参数: symbol 为纯6位代码，日期格式 YYYYMMDD
-            logger.info(f"[AkshareFetcher] 腾讯信源 stock_zh_a_hist_tx({stock_code})")
-            t0 = time.time()
-            df = ak.stock_zh_a_hist_tx(
-                symbol=stock_code,
-                start_date=sd,
-                end_date=ed,
-            )
-            elapsed = time.time() - t0
-            if df is not None and not df.empty:
-                self._limiter.record_success()
-                logger.info(f"[AkshareFetcher] 腾讯信源成功: {len(df)} 行, {elapsed:.2f}s")
-                return source_name, df
-        except Exception as e:
-            category = classify_error(e)
-            if category == ErrorCategory.API_SYNTAX:
-                logger.debug(f"[AkshareFetcher] 腾讯信源 API 不兼容: {e}")
-            else:
-                logger.warning(f"[AkshareFetcher] 腾讯信源失败: {e}")
-        return source_name, pd.DataFrame()
+            return source_name, pd.DataFrame(), detail
 
     # ---- 日K线: 并发多信源 + 交叉校验 ----
 
@@ -273,84 +220,100 @@ class AkshareFetcher(BaseFetcher):
         """
         并发调用 akshare 支持的所有信源获取日K线数据。
 
-        1. 并发调用: 东方财富 + 新浪 + 163 + 腾讯
+        1. 并发调用: 东方财富 + 新浪 + 腾讯
         2. 收集所有成功返回的数据
         3. 如果多源都有数据，通过 CrossValidator 交叉校验
         4. 返回最佳数据源的数据
 
         如果并发无法执行 (如线程池不可用), 降级为顺序调用。
         """
-        sd = start_date.replace("-", "")
-        ed = end_date.replace("-", "")
-
-        # 定义所有信源任务
-        source_tasks = [
-            (self._fetch_eastmoney, stock_code, sd, ed),
-            (self._fetch_sina, stock_code, sd, ed),
-            (self._fetch_163, stock_code, sd, ed),
-            (self._fetch_tencent, stock_code, sd, ed),
-        ]
-
         source_results: Dict[str, pd.DataFrame] = {}
+        diagnostics = {
+            "attempted_sources": [spec["source_name"] for spec in self._daily_source_specs],
+            "successful_sources": [],
+            "failed_sources": [],
+            "failure_reasons": {},
+            "best_source": None,
+            "merged_sources": [],
+            "consistency_score": 0.0,
+            "source_details": {},
+        }
 
-        # 并发调用所有信源
         try:
-            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="ak_src") as executor:
+            with ThreadPoolExecutor(
+                max_workers=max(len(self._daily_source_specs), 1),
+                thread_name_prefix="ak_src",
+            ) as executor:
                 futures = {
-                    executor.submit(fn, code, s, e): fn.__name__
-                    for fn, code, s, e in source_tasks
+                    executor.submit(
+                        self._fetch_daily_source,
+                        source_config,
+                        stock_code,
+                        start_date,
+                        end_date,
+                    ): source_config["source_name"]
+                    for source_config in self._daily_source_specs
                 }
                 for future in as_completed(futures, timeout=60):
+                    source_name = futures[future]
                     try:
-                        source_name, df = future.result(timeout=30)
-                        if df is not None and not df.empty:
-                            # 先标准化再放入校验
-                            normalized = self._normalize_data(df, stock_code)
-                            if not normalized.empty:
-                                source_results[source_name] = normalized
-                    except Exception as e:
-                        task_name = futures[future]
-                        logger.warning(
-                            f"[AkshareFetcher] 信源任务 {task_name} 异常: {e}"
-                        )
-        except Exception as e:
-            logger.warning(
-                f"[AkshareFetcher] 并发执行异常，降级为顺序调用: {e}"
-            )
-            # 降级: 顺序调用
-            for fn, code, s, e in source_tasks:
-                try:
-                    source_name, df = fn(code, s, e)
+                        _, df, detail = future.result(timeout=35)
+                    except Exception as exc:
+                        diagnostics["failed_sources"].append(source_name)
+                        diagnostics["failure_reasons"][source_name] = str(exc)
+                        diagnostics["source_details"][source_name] = {
+                            "status": "failed",
+                            "failure_reason": str(exc),
+                        }
+                        continue
+
+                    diagnostics["source_details"][source_name] = detail
                     if df is not None and not df.empty:
-                        normalized = self._normalize_data(df, stock_code)
+                        normalized = self._normalize_data(df, stock_code, source_name)
                         if not normalized.empty:
                             source_results[source_name] = normalized
-                except Exception as ex:
-                    logger.warning(f"[AkshareFetcher] 顺序调用 {fn.__name__} 失败: {ex}")
+                            diagnostics["successful_sources"].append(source_name)
+                            continue
+
+                    diagnostics["failed_sources"].append(source_name)
+                    diagnostics["failure_reasons"][source_name] = detail.get("failure_reason") or "empty dataframe"
+        except Exception as exc:
+            logger.warning("[AkshareFetcher] 日线并发执行异常: %s", exc)
 
         if not source_results:
-            logger.warning(f"[AkshareFetcher] {stock_code} 所有信源均无数据")
+            self._last_source_diagnostic = diagnostics
+            logger.warning("[AkshareFetcher] %s 所有信源均无有效数据", stock_code)
             return pd.DataFrame()
 
-        # 单源直接返回
         if len(source_results) == 1:
             source_name = next(iter(source_results))
-            logger.info(f"[AkshareFetcher] {stock_code} 仅单信源 {source_name} 返回数据")
+            diagnostics["best_source"] = source_name
+            diagnostics["merged_sources"] = [source_name]
+            diagnostics["consistency_score"] = 1.0
+            self._last_source_diagnostic = diagnostics
             return source_results[source_name]
 
-        # 多源交叉校验
         report = self._validator.validate_daily_data(source_results)
+        diagnostics["best_source"] = report.best_source
+        diagnostics["merged_sources"] = list(source_results.keys())
+        diagnostics["consistency_score"] = report.consistency_score
+        diagnostics["anomalies"] = report.anomalies
+        self._last_source_diagnostic = diagnostics
+
         logger.info(
-            f"[AkshareFetcher] {stock_code} 内部交叉校验: "
-            f"{len(source_results)} 源, "
-            f"一致性={report.consistency_score:.4f}, "
-            f"最佳源={report.best_source}, "
-            f"异常数={len(report.anomalies)}"
+            "[AkshareFetcher] %s 内部交叉校验完成: %s",
+            stock_code,
+            {
+                "best_source": report.best_source,
+                "consistency_score": round(report.consistency_score, 4),
+                "successful_sources": diagnostics["successful_sources"],
+                "failed_sources": diagnostics["failed_sources"],
+            },
         )
 
         if report.merged_dataframe is not None and not report.merged_dataframe.empty:
             return report.merged_dataframe
-        if report.best_dataframe is not None:
+        if report.best_dataframe is not None and not report.best_dataframe.empty:
             return report.best_dataframe
         return next(iter(source_results.values()))
 
@@ -358,33 +321,25 @@ class AkshareFetcher(BaseFetcher):
         self,
         df: pd.DataFrame,
         stock_code: str,
+        source_name: Optional[str] = None,
     ) -> pd.DataFrame:
         """将 akshare 列名映射到标准列名"""
         if df is None or df.empty:
             return pd.DataFrame(columns=STANDARD_COLUMNS)
 
-        col_map = {
-            "日期": "date",
+        source_map = self._daily_api_config["sources"].get(source_name or "", {})
+        col_map = dict(source_map.get("field_mapping", {}))
+        col_map.update({
             "date": "date",
-            "开盘": "open",
             "open": "open",
-            "最高": "high",
             "high": "high",
-            "最低": "low",
             "low": "low",
-            "收盘": "close",
             "close": "close",
-            "成交量": "volume",
             "volume": "volume",
-            "成交额": "amount",
             "amount": "amount",
-            "涨跌幅": "pct_chg",
             "pct_chg": "pct_chg",
-        }
-
-        df = df.rename(
-            columns={k: v for k, v in col_map.items() if k in df.columns}
-        )
+        })
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
         # 确保必须的列存在
         for col in STANDARD_COLUMNS:
@@ -638,11 +593,9 @@ class AkshareFetcher(BaseFetcher):
 
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """获取A股全市场股票列表"""
-        self._enforce_rate_limit()
         try:
-            import akshare as ak
-            df = ak.stock_info_a_code_name()
-            return df
+            self._enforce_rate_limit()
+            return call_akshare("stock_list")
         except Exception as e:
             logger.warning(f"[AkshareFetcher] 股票列表获取失败: {e}")
             return None

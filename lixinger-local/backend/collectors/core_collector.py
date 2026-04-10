@@ -144,27 +144,15 @@ class CoreCollector(BaseCollector):
         """
         logger.info("开始采集 A 股基础信息到 stock_basic (多数据源)...")
 
-        df = None
-        source = "unknown"
-
-        # 策略1: 通过 DataFetcherManager 获取股票列表
-        try:
-            df = self.manager.get_stock_list()
-            if df is not None and not df.empty:
-                source = "DataFetcherManager"
-                logger.info(f"股票列表来自 DataFetcherManager, {len(df)} 条")
-        except Exception as e:
-            logger.warning(f"DataFetcherManager 股票列表失败: {e}")
-
-        # 策略2: 通过 api_compat fallback
+        df = self.manager.get_stock_list()
+        source = "DataFetcherManager"
         if df is None or df.empty:
-            try:
-                df = call_akshare("stock_list")
-                source = "api_compat"
-                logger.info(f"股票列表来自 api_compat, {len(df)} 条")
-            except AkshareAPIError as e:
-                logger.error(f"股票列表采集全部失败: {e}")
-                return 0
+            logger.error(
+                "股票列表采集全部失败: %s",
+                self.manager.get_last_request_diagnostic("stock_list"),
+            )
+            return 0
+        logger.info(f"股票列表来自 DataFetcherManager, {len(df)} 条")
 
         if df is None or df.empty:
             logger.warning("stock_basic 采集结果为空")
@@ -207,8 +195,7 @@ class CoreCollector(BaseCollector):
         采集日度量价与估值数据，写入 daily_market_valuation 表。
 
         多数据源策略（参考 daily_stock_analysis 架构）:
-        1. 日K线行情: DataFetcherManager 自动 failover
-           (efinance → akshare → tushare → baostock)
+        1. 日K线行情: DataFetcherManager 并发调度多个框架
         2. 估值指标: api_compat (stock_a_indicator_lg)
         3. 后复权因子: BaostockFetcher.get_adjust_factor() (独有)
 
@@ -281,37 +268,11 @@ class CoreCollector(BaseCollector):
                     }
         except DataFetchError as e:
             logger.warning(f"{ts_code} 日K线多数据源全部失败: {e}")
-            # Fallback: 直接调用 api_compat (最后的保险)
-            self._rate_limit(0.5, 1.0)
-            try:
-                df_quotes = call_akshare(
-                    "daily_quotes",
-                    symbol=pure_code,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust="",
-                )
-                if df_quotes is not None and not df_quotes.empty:
-                    data_source = "api_compat_fallback"
-                    col_map = {
-                        "日期": "trade_date", "date": "trade_date",
-                        "收盘": "close", "close": "close",
-                        "换手率": "turnover_rate", "turnover_rate": "turnover_rate",
-                    }
-                    df_quotes = df_quotes.rename(
-                        columns={k: v for k, v in col_map.items() if k in df_quotes.columns}
-                    )
-                    for _, row in df_quotes.iterrows():
-                        td = _safe_date(row.get("trade_date"))
-                        if td is None:
-                            continue
-                        quotes_data[td] = {
-                            "close": _safe_float(row.get("close")),
-                            "turnover_rate": _safe_float(row.get("turnover_rate")),
-                        }
-            except AkshareAPIError as e2:
-                logger.warning(f"{ts_code} api_compat fallback 也失败: {e2}")
+            logger.warning(
+                "%s 日K线诊断: %s",
+                ts_code,
+                self.manager.get_last_request_diagnostic("daily_quotes"),
+            )
 
         # ---- 数据源2: 估值指标 (akshare stock_a_indicator_lg) ----
         self._rate_limit(0.5, 1.0)
@@ -428,100 +389,86 @@ class CoreCollector(BaseCollector):
 
         # 数据缓存 {end_date_str: {fields...}}
         data_map: Dict[str, Dict] = {}
+        financial_bundle = self.manager.get_financial_report_frames(pure_code)
 
         # ---- 主数据源1: 利润表 ----
-        self._rate_limit()
-        try:
-            df = call_akshare("financial_income", stock=pure_code)
-            if df is not None and not df.empty:
-                for _, row in df.iterrows():
-                    end_date_str = self._extract_report_date(row)
-                    if not end_date_str:
-                        continue
-                    if end_date_str not in data_map:
-                        data_map[end_date_str] = {}
-                    entry = data_map[end_date_str]
-                    entry["total_revenue"] = _safe_float(
-                        self._pick_col(row, ["营业总收入", "total_revenue"])
-                    )
-                    entry["net_profit"] = _safe_float(
-                        self._pick_col(row, ["净利润", "net_profit"])
-                    )
-                    entry["net_profit_deduct"] = _safe_float(
-                        self._pick_col(row, [
-                            "扣除非经常性损益后的净利润",
-                            "net_profit_deducted", "net_profit_deduct",
-                        ])
-                    )
-                    # 毛利率计算
-                    rev = _safe_float(
-                        self._pick_col(row, ["营业收入", "operating_revenue"])
-                    ) or entry.get("total_revenue")
-                    cost = _safe_float(
-                        self._pick_col(row, ["营业总成本", "营业成本", "operating_cost"])
-                    )
-                    if rev and cost and rev != 0:
-                        entry["gross_margin"] = round((rev - cost) / rev * 100, 4)
-        except AkshareAPIError as e:
-            logger.warning(f"{ts_code} 利润表采集失败: {e}")
+        df = financial_bundle.get("income")
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                end_date_str = self._extract_report_date(row)
+                if not end_date_str:
+                    continue
+                if end_date_str not in data_map:
+                    data_map[end_date_str] = {}
+                entry = data_map[end_date_str]
+                entry["total_revenue"] = _safe_float(
+                    self._pick_col(row, ["营业总收入", "total_revenue"])
+                )
+                entry["net_profit"] = _safe_float(
+                    self._pick_col(row, ["净利润", "net_profit"])
+                )
+                entry["net_profit_deduct"] = _safe_float(
+                    self._pick_col(row, [
+                        "扣除非经常性损益后的净利润",
+                        "net_profit_deducted", "net_profit_deduct",
+                    ])
+                )
+                rev = _safe_float(
+                    self._pick_col(row, ["营业收入", "operating_revenue"])
+                ) or entry.get("total_revenue")
+                cost = _safe_float(
+                    self._pick_col(row, ["营业总成本", "营业成本", "operating_cost"])
+                )
+                if rev and cost and rev != 0:
+                    entry["gross_margin"] = round((rev - cost) / rev * 100, 4)
 
         # ---- 主数据源2: 资产负债表（用于资产负债率和ROE）----
-        self._rate_limit()
-        try:
-            df = call_akshare("financial_balance", stock=pure_code)
-            if df is not None and not df.empty:
-                for _, row in df.iterrows():
-                    end_date_str = self._extract_report_date(row)
-                    if not end_date_str:
-                        continue
-                    if end_date_str not in data_map:
-                        data_map[end_date_str] = {}
-                    entry = data_map[end_date_str]
-                    total_assets = _safe_float(
-                        self._pick_col(row, ["资产总计", "total_assets"])
+        df = financial_bundle.get("balance")
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                end_date_str = self._extract_report_date(row)
+                if not end_date_str:
+                    continue
+                if end_date_str not in data_map:
+                    data_map[end_date_str] = {}
+                entry = data_map[end_date_str]
+                total_assets = _safe_float(
+                    self._pick_col(row, ["资产总计", "total_assets"])
+                )
+                total_liab = _safe_float(
+                    self._pick_col(row, ["负债合计", "total_liabilities"])
+                )
+                equity = _safe_float(
+                    self._pick_col(row, [
+                        "所有者权益合计",
+                        "归属于母公司所有者权益合计",
+                        "total_equity",
+                    ])
+                )
+                if total_assets and total_liab and total_assets != 0:
+                    entry["liability_to_asset"] = round(
+                        total_liab / total_assets * 100, 4
                     )
-                    total_liab = _safe_float(
-                        self._pick_col(row, ["负债合计", "total_liabilities"])
-                    )
-                    equity = _safe_float(
-                        self._pick_col(row, [
-                            "所有者权益合计",
-                            "归属于母公司所有者权益合计",
-                            "total_equity",
-                        ])
-                    )
-                    # 资产负债率
-                    if total_assets and total_liab and total_assets != 0:
-                        entry["liability_to_asset"] = round(
-                            total_liab / total_assets * 100, 4
-                        )
-                    # ROE
-                    profit = entry.get("net_profit")
-                    if profit and equity and equity != 0:
-                        entry["roe"] = round(profit / equity * 100, 4)
-        except AkshareAPIError as e:
-            logger.warning(f"{ts_code} 资产负债表采集失败: {e}")
+                profit = entry.get("net_profit")
+                if profit and equity and equity != 0:
+                    entry["roe"] = round(profit / equity * 100, 4)
 
         # ---- 主数据源3: 现金流量表 ----
-        self._rate_limit()
-        try:
-            df = call_akshare("financial_cashflow", stock=pure_code)
-            if df is not None and not df.empty:
-                for _, row in df.iterrows():
-                    end_date_str = self._extract_report_date(row)
-                    if not end_date_str:
-                        continue
-                    if end_date_str not in data_map:
-                        data_map[end_date_str] = {}
-                    entry = data_map[end_date_str]
-                    entry["net_cash_flows_oper"] = _safe_float(
-                        self._pick_col(row, [
-                            "经营活动产生的现金流量净额",
-                            "operating_cash_flow",
-                        ])
-                    )
-        except AkshareAPIError as e:
-            logger.warning(f"{ts_code} 现金流量表采集失败: {e}")
+        df = financial_bundle.get("cashflow")
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                end_date_str = self._extract_report_date(row)
+                if not end_date_str:
+                    continue
+                if end_date_str not in data_map:
+                    data_map[end_date_str] = {}
+                entry = data_map[end_date_str]
+                entry["net_cash_flows_oper"] = _safe_float(
+                    self._pick_col(row, [
+                        "经营活动产生的现金流量净额",
+                        "operating_cash_flow",
+                    ])
+                )
 
         # ---- 补充数据源: FundamentalAdapter (fail-open) ----
         try:

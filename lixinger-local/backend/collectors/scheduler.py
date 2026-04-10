@@ -53,10 +53,10 @@ class DataCollector:
 
     def __init__(self, db: Session):
         self.db = db
-        self.akshare = AkshareCollector(db)
-        self.chrome = ChromeCollector()
         # 创建共享的 DataFetcherManager，注入到 CoreCollector
         self._manager = DataFetcherManager()
+        self.akshare = AkshareCollector(db, manager=self._manager)
+        self.chrome = ChromeCollector()
         self.core = CoreCollector(db, manager=self._manager)
         logger.info(
             f"DataCollector 初始化完成, "
@@ -65,6 +65,10 @@ class DataCollector:
 
     def close(self):
         """释放资源"""
+        try:
+            self.akshare.close()
+        except Exception as e:
+            logger.warning(f"AkshareCollector close 异常: {e}")
         if self._manager:
             self._manager.close()
             self._manager = None

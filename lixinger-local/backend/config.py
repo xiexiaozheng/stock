@@ -25,7 +25,7 @@ CHROME_MCP_INTERVAL = float(os.getenv("CHROME_MCP_INTERVAL", "3.0"))  # 秒
 # 并发多源采集配置
 # =====================================================================
 
-# 主开关: 是否启用并发多源采集 (True=并发+交叉校验, False=顺序failover)
+# 主开关: 是否启用并发多源采集 (保留兼容配置项，当前统一走并发+交叉校验)
 CONCURRENT_FETCH_ENABLED = os.getenv("CONCURRENT_FETCH_ENABLED", "true").lower() == "true"
 
 # 并发采集最大线程数

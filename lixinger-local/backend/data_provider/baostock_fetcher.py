@@ -1,5 +1,5 @@
 """
-BaostockFetcher — 证券宝数据源 Fetcher (Priority 3)
+BaostockFetcher — 证券宝数据源 Fetcher
 
 参考 ZhuLinsen/daily_stock_analysis data_provider/baostock_fetcher.py
 
@@ -49,7 +49,7 @@ class BaostockFetcher(BaseFetcher):
     """
 
     name = "BaostockFetcher"
-    priority = 3
+    framework_key = "baostock"
 
     def __init__(self):
         super().__init__()

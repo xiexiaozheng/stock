@@ -1,5 +1,5 @@
 """
-EfinanceFetcher — efinance 库数据源 Fetcher (Priority 0)
+EfinanceFetcher — efinance 库数据源 Fetcher
 
 参考 ZhuLinsen/daily_stock_analysis data_provider/efinance_fetcher.py
 
@@ -49,7 +49,7 @@ class EfinanceFetcher(BaseFetcher):
     """
 
     name = "EfinanceFetcher"
-    priority = 0
+    framework_key = "efinance"
 
     def __init__(self, timeout: float = 10.0):
         super().__init__()
