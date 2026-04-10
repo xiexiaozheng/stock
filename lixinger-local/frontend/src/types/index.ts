@@ -154,3 +154,14 @@ export interface CollectStatus {
   progress: string
   started_at?: string
 }
+
+export interface LatestValuationSnapshot {
+  ts_code: string
+  trade_date: string
+  close?: number | null
+  turnover_rate?: number | null
+  pe_ttm?: number | null
+  pb?: number | null
+  total_mv?: number | null
+  source: string
+}

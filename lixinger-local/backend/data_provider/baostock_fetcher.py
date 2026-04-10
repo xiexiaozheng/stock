@@ -283,8 +283,7 @@ class BaostockFetcher(BaseFetcher):
         """获取全市场股票列表"""
         try:
             with self._baostock_session() as bs:
-                today = datetime.today().strftime("%Y-%m-%d")
-                rs = bs.query_stock_basic(day=today)
+                rs = bs.query_stock_basic()
 
                 if rs.error_code != "0":
                     return None

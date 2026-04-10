@@ -122,6 +122,56 @@ def get_dividends(code: str, db: Session = Depends(get_db)):
     return [DividendResponse.model_validate(r) for r in rows]
 
 
+@router.get("/{code}/latest-valuation")
+def get_latest_valuation(code: str, db: Session = Depends(get_db)):
+    """
+    获取股票最新估值快照。
+
+    数据来源：AKShare stock_zh_a_spot_em 全市场实时行情接口，
+    通过 CoreCollector.collect_latest_valuation_snapshot() 写入 daily_market_valuation 表。
+    返回最近一条含估值数据的记录（pe_ttm 或 pb 不为空）。
+    若尚未采集快照数据，返回 404。
+    """
+    from models.core import DailyMarketValuation
+    from sqlalchemy import or_
+
+    # 推断 ts_code
+    pure = code.split(".")[0] if "." in code else code
+    pure = pure.zfill(6)
+    if pure.startswith(("60", "68")):
+        ts_code = f"{pure}.SH"
+    elif pure.startswith(("43", "83", "87", "88", "92")):
+        ts_code = f"{pure}.BJ"
+    else:
+        ts_code = f"{pure}.SZ"
+
+    row = (
+        db.query(DailyMarketValuation)
+        .filter(
+            DailyMarketValuation.ts_code == ts_code,
+            or_(
+                DailyMarketValuation.pe_ttm.isnot(None),
+                DailyMarketValuation.pb.isnot(None),
+            ),
+        )
+        .order_by(DailyMarketValuation.trade_date.desc())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"股票 {code} 暂无估值快照数据")
+
+    return {
+        "ts_code": row.ts_code,
+        "trade_date": str(row.trade_date),
+        "close": row.close,
+        "turnover_rate": row.turnover_rate,
+        "pe_ttm": row.pe_ttm,
+        "pb": row.pb,
+        "total_mv": row.total_mv,
+        "source": "stock_zh_a_spot_em",
+    }
+
+
 @router.get("/{code}/dashboard")
 def get_dashboard(code: str, db: Session = Depends(get_db)):
     """获取股票综合仪表盘数据（聚合接口）"""

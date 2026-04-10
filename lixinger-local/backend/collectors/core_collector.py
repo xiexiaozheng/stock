@@ -101,7 +101,8 @@ class CoreCollector(BaseCollector):
 
     数据源:
     - 日K线: efinance/akshare(东财+新浪+163)/tushare/baostock/yfinance/longbridge/eastmoney
-    - 估值: akshare (stock_a_indicator_lg)
+    - 历史估值: 不可用 (stock_a_indicator_lg 在当前 AKShare 版本中不存在)
+    - 最新估值快照: akshare stock_zh_a_spot_em (collect_latest_valuation_snapshot)
     - 复权因子: baostock (专有)
     - 财务: akshare + FundamentalAdapter
     """
@@ -196,7 +197,8 @@ class CoreCollector(BaseCollector):
 
         多数据源策略（参考 daily_stock_analysis 架构）:
         1. 日K线行情: DataFetcherManager 并发调度多个框架
-        2. 估值指标: api_compat (stock_a_indicator_lg)
+        2. 历史估值指标: 已禁用 — stock_a_indicator_lg 在当前 AKShare 版本中不可用
+           → 最新估值快照通过 collect_latest_valuation_snapshot() 批量写入
         3. 后复权因子: BaostockFetcher.get_adjust_factor() (独有)
 
         数据合并:
@@ -274,38 +276,14 @@ class CoreCollector(BaseCollector):
                 self.manager.get_last_request_diagnostic("daily_quotes"),
             )
 
-        # ---- 数据源2: 估值指标 (akshare stock_a_indicator_lg) ----
-        self._rate_limit(0.5, 1.0)
+        # ---- 数据源2: 历史估值指标 ----
+        # 历史估值数据源当前不可用: AKShare 未提供 stock_a_indicator_lg 等价接口。
+        # 最新估值快照通过 collect_latest_valuation_snapshot() 批量获取并写入本表。
         valuation_data = {}
-        try:
-            df_val = call_akshare("valuation_indicator", symbol=pure_code)
-            if df_val is not None and not df_val.empty:
-                col_map = {
-                    "trade_date": "trade_date", "日期": "trade_date",
-                    "pe": "pe_ttm", "pe_ttm": "pe_ttm", "市盈率(TTM)": "pe_ttm",
-                    "pb": "pb", "市净率": "pb",
-                    "ps": "ps_ttm", "ps_ttm": "ps_ttm",
-                    "total_mv": "total_mv", "总市值": "total_mv",
-                    "dv_ratio": "dv_ttm", "股息率": "dv_ttm",
-                    "pcf": "pcf_ttm", "pcf_ocf": "pcf_ttm",
-                }
-                df_val = df_val.rename(
-                    columns={k: v for k, v in col_map.items() if k in df_val.columns}
-                )
-                for _, row in df_val.iterrows():
-                    td = _safe_date(row.get("trade_date"))
-                    if td is None:
-                        continue
-                    valuation_data[td] = {
-                        "pe_ttm": _safe_float(row.get("pe_ttm")),
-                        "pb": _safe_float(row.get("pb")),
-                        "ps_ttm": _safe_float(row.get("ps_ttm")),
-                        "total_mv": _safe_float(row.get("total_mv")),
-                        "dv_ttm": _safe_float(row.get("dv_ttm")),
-                        "pcf_ttm": _safe_float(row.get("pcf_ttm")),
-                    }
-        except AkshareAPIError as e:
-            logger.warning(f"{ts_code} 估值指标采集失败: {e}")
+        logger.debug(
+            "%s 历史估值数据源已禁用 (stock_a_indicator_lg 不可用)，估值字段将从最新快照填充",
+            ts_code,
+        )
 
         # ---- 数据源3: 后复权因子 (BaostockFetcher 独有) ----
         adj_factor_data = {}
@@ -365,9 +343,98 @@ class CoreCollector(BaseCollector):
             self._upsert(DailyMarketValuation, rows, ["ts_code", "trade_date"])
         logger.debug(
             f"{ts_code} daily_market_valuation 写入 {len(rows)} 条 "
-            f"(行情: {data_source}, 估值: akshare, "
+            f"(行情: {data_source}, 历史估值: 不可用/已禁用, "
             f"复权: {'baostock' if adj_factor_data else 'N/A'})"
         )
+        return len(rows)
+
+    # ======================== 最新估值快照 ========================
+
+    def collect_latest_valuation_snapshot(self) -> int:
+        """
+        从 AKShare stock_zh_a_spot_em 获取全市场最新估值快照，
+        并将估值字段写入 daily_market_valuation 表（今日日期）。
+
+        设计原则:
+        - 仅调用全市场接口一次，然后按股票代码分发，避免逐股重复拉取。
+        - 写入 pe_ttm、pb、total_mv、circ_mv、close、turnover_rate。
+        - 如果某股票在 stock_basic 中不存在，则跳过（避免外键约束问题）。
+
+        :return: 成功写入的行数
+        """
+        logger.info("开始采集全市场最新估值快照 (stock_zh_a_spot_em)...")
+
+        try:
+            df = call_akshare("latest_valuation_snapshot")
+        except AkshareAPIError as e:
+            logger.error("全市场最新估值快照采集失败: %s", e)
+            return 0
+
+        if df is None or df.empty:
+            logger.warning("全市场最新估值快照返回空数据")
+            return 0
+
+        # 标准化列名
+        col_map = {
+            "代码": "code",
+            "名称": "name",
+            "最新价": "close",
+            "换手率": "turnover_rate",
+            "市盈率-动态": "pe_ttm",
+            "市净率": "pb",
+            "总市值": "total_mv",
+            "流通市值": "circ_mv",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        today = datetime.today().date()
+
+        # 构建 code → 行 的快速索引 (纯数字6位代码)
+        snapshot: Dict[str, Any] = {}
+        for _, row in df.iterrows():
+            raw_code = str(row.get("code", "")).strip()
+            if raw_code:
+                snapshot[raw_code.zfill(6)] = row
+
+        logger.info("全市场快照共 %d 条，开始写入 daily_market_valuation...", len(snapshot))
+
+        # 获取 stock_basic 中所有上市股票
+        from sqlalchemy import text as sa_text
+        ts_codes = [
+            r[0]
+            for r in self.db.execute(
+                sa_text("SELECT ts_code FROM stock_basic WHERE is_delist = 0")
+            ).fetchall()
+        ]
+
+        rows = []
+        for ts_code in ts_codes:
+            pure_code = _ts_code_to_pure(ts_code)
+            row = snapshot.get(pure_code)
+            if row is None:
+                continue
+
+            pe_val = _safe_float(row.get("pe_ttm"))
+            pb_val = _safe_float(row.get("pb"))
+            # pe_ttm and pb can be negative (loss-making) or 0; filter out extreme outliers
+            if pe_val is not None and (pe_val <= -10000 or pe_val > 100000):
+                pe_val = None
+            if pb_val is not None and (pb_val <= 0 or pb_val > 100000):
+                pb_val = None
+
+            rows.append({
+                "ts_code": ts_code,
+                "trade_date": today,
+                "close": _safe_float(row.get("close")),
+                "turnover_rate": _safe_float(row.get("turnover_rate")),
+                "total_mv": _safe_float(row.get("total_mv")),
+                "pe_ttm": pe_val,
+                "pb": pb_val,
+            })
+
+        if rows:
+            self._upsert(DailyMarketValuation, rows, ["ts_code", "trade_date"])
+        logger.info("最新估值快照写入 %d 条 (日期: %s)", len(rows), today)
         return len(rows)
 
     # ======================== 季度财务核心 ========================

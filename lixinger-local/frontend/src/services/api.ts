@@ -2,7 +2,7 @@ import axios from 'axios'
 import type {
   Stock, StockListResponse, DailyQuote, Financial, Valuation,
   Dividend, WatchlistItem, DashboardData, ScreenerConfig,
-  ScreenerResult, ScreenerPreset, CollectStatus,
+  ScreenerResult, ScreenerPreset, CollectStatus, LatestValuationSnapshot,
 } from '@/types'
 
 const api = axios.create({
@@ -42,6 +42,9 @@ export const stocksApi = {
   getDividends: (code: string) => api.get<Dividend[]>(`/stocks/${code}/dividends`),
 
   getDashboard: (code: string) => api.get<DashboardData>(`/stocks/${code}/dashboard`),
+
+  getLatestValuation: (code: string) =>
+    api.get<LatestValuationSnapshot>(`/stocks/${code}/latest-valuation`),
 }
 
 // ======================== 筛选器 ========================

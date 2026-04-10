@@ -38,15 +38,21 @@ def _safe_float(val) -> Optional[float]:
 
 
 def _safe_date(val) -> Optional[date]:
-    """安全转换为 date 对象"""
+    """安全转换为 date 对象，兼容多种格式（含带时间的字符串和中文日期）"""
     if val is None:
         return None
+    if isinstance(val, datetime):
+        return val.date()
     if isinstance(val, date):
         return val
     if isinstance(val, str):
-        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"):
+        s = val.strip()
+        # Strip time portion if present: "2024-12-31 00:00:00" or "2024-12-31T00:00:00"
+        if len(s) > 10 and s[10] in (" ", "T"):
+            s = s[:10]
+        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d", "%Y年%m月%d日"):
             try:
-                return datetime.strptime(val.strip(), fmt).date()
+                return datetime.strptime(s, fmt).date()
             except ValueError:
                 continue
     return None
@@ -229,10 +235,11 @@ class AkshareCollector(BaseCollector):
 
         income_df = frames.get("income")
         if income_df is not None and not income_df.empty:
+            _skipped: list = []
             for _, row in income_df.iterrows():
-                key, rt = self._parse_report_key(row)
+                key, rt, raw_val = self._parse_report_key(row)
                 if key is None:
-                    logger.warning("%s 利润表存在无法解析的报告期，已跳过", stock_code)
+                    _skipped.append(raw_val)
                     continue
                 if key not in data_map:
                     data_map[key] = {"report_type": rt}
@@ -247,13 +254,19 @@ class AkshareCollector(BaseCollector):
                 entry["net_profit_deducted"] = _safe_float(
                     self._find_col(row, ["扣除非经常性损益后的净利润", "net_profit_deducted"])
                 )
+            if _skipped:
+                logger.warning(
+                    "%s 利润表存在 %d 个无法解析的报告期，已跳过 (首例: %r)",
+                    stock_code, len(_skipped), _skipped[0],
+                )
 
         balance_df = frames.get("balance")
         if balance_df is not None and not balance_df.empty:
+            _skipped = []
             for _, row in balance_df.iterrows():
-                key, rt = self._parse_report_key(row)
+                key, rt, raw_val = self._parse_report_key(row)
                 if key is None:
-                    logger.warning("%s 资产负债表存在无法解析的报告期，已跳过", stock_code)
+                    _skipped.append(raw_val)
                     continue
                 if key not in data_map:
                     data_map[key] = {"report_type": rt}
@@ -262,13 +275,19 @@ class AkshareCollector(BaseCollector):
                 entry["total_liabilities"] = _safe_float(self._find_col(row, ["负债合计", "total_liabilities"]))
                 entry["total_equity"] = _safe_float(self._find_col(row, ["所有者权益合计", "归属于母公司所有者权益合计", "total_equity"]))
                 entry["goodwill"] = _safe_float(self._find_col(row, ["商誉", "goodwill"]))
+            if _skipped:
+                logger.warning(
+                    "%s 资产负债表存在 %d 个无法解析的报告期，已跳过 (首例: %r)",
+                    stock_code, len(_skipped), _skipped[0],
+                )
 
         cashflow_df = frames.get("cashflow")
         if cashflow_df is not None and not cashflow_df.empty:
+            _skipped = []
             for _, row in cashflow_df.iterrows():
-                key, rt = self._parse_report_key(row)
+                key, rt, raw_val = self._parse_report_key(row)
                 if key is None:
-                    logger.warning("%s 现金流量表存在无法解析的报告期，已跳过", stock_code)
+                    _skipped.append(raw_val)
                     continue
                 if key not in data_map:
                     data_map[key] = {"report_type": rt}
@@ -285,6 +304,11 @@ class AkshareCollector(BaseCollector):
                 ocf = entry.get("operating_cash_flow")
                 icf = entry.get("investing_cash_flow")
                 entry["free_cash_flow"] = ocf + icf if (ocf is not None and icf is not None) else None
+            if _skipped:
+                logger.warning(
+                    "%s 现金流量表存在 %d 个无法解析的报告期，已跳过 (首例: %r)",
+                    stock_code, len(_skipped), _skipped[0],
+                )
 
         rows = []
         for report_date, fields in data_map.items():
@@ -317,7 +341,7 @@ class AkshareCollector(BaseCollector):
             return
 
         for _, row in df.iterrows():
-            key, rt = self._parse_report_key(row)
+            key, rt, _raw = self._parse_report_key(row)
             if key not in data_map:
                 data_map[key] = {"report_type": rt}
             entry = data_map[key]
@@ -345,7 +369,7 @@ class AkshareCollector(BaseCollector):
             return
 
         for _, row in df.iterrows():
-            key, rt = self._parse_report_key(row)
+            key, rt, _raw = self._parse_report_key(row)
             if key not in data_map:
                 data_map[key] = {"report_type": rt}
             entry = data_map[key]
@@ -367,7 +391,7 @@ class AkshareCollector(BaseCollector):
             return
 
         for _, row in df.iterrows():
-            key, rt = self._parse_report_key(row)
+            key, rt, _raw = self._parse_report_key(row)
             if key not in data_map:
                 data_map[key] = {"report_type": rt}
             entry = data_map[key]
@@ -388,9 +412,9 @@ class AkshareCollector(BaseCollector):
                 entry["free_cash_flow"] = None
 
     def _parse_report_key(self, row) -> tuple:
-        """从行数据中解析报告期 key 和 report_type"""
+        """从行数据中解析报告期 key 和 report_type，返回 (date|None, report_type, raw_val)"""
         date_col = self._find_col(row, ["报告期", "report_date", "REPORT_DATE", "date"])
-        if date_col:
+        if date_col is not None:
             d = _safe_date(str(date_col))
             if d:
                 month = d.month
@@ -404,8 +428,8 @@ class AkshareCollector(BaseCollector):
                     rt = "Q3"
                 else:
                     rt = "annual"
-                return d, rt
-        return None, "annual"
+                return d, rt, str(date_col)
+        return None, "annual", str(date_col) if date_col is not None else None
 
     @staticmethod
     def _find_col(row, candidates: List[str]):
@@ -446,49 +470,19 @@ class AkshareCollector(BaseCollector):
     # ======================== 估值指标 ========================
 
     def collect_valuations(self, stock_code: str) -> int:
-        """采集估值历史数据（PE-TTM、PB、PS-TTM、市值等）"""
-        logger.info(f"采集 {stock_code} 估值指标...")
-        self._rate_limit()
-        try:
-            df = call_akshare("valuation_indicator", symbol=stock_code)
-        except AkshareAPIError as e:
-            logger.error(f"{stock_code} 估值采集失败: {e}")
-            return 0
+        """
+        采集估值历史数据（PE-TTM、PB、PS-TTM、市值等）。
 
-        if df is None or df.empty:
-            return 0
-
-        col_map = {
-            "trade_date": "trade_date", "日期": "trade_date",
-            "pe": "pe_ttm", "pe_ttm": "pe_ttm", "市盈率(TTM)": "pe_ttm",
-            "pb": "pb", "市净率": "pb",
-            "ps": "ps_ttm", "ps_ttm": "ps_ttm",
-            "total_mv": "total_market_value", "总市值": "total_market_value",
-            "circ_mv": "circulating_market_value", "流通市值": "circulating_market_value",
-            "dv_ratio": "dividend_yield", "股息率": "dividend_yield",
-        }
-        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-
-        rows = []
-        for _, row in df.iterrows():
-            td = _safe_date(row.get("trade_date"))
-            if td is None:
-                continue
-            rows.append({
-                "stock_code": stock_code,
-                "trade_date": td,
-                "pe_ttm": _safe_float(row.get("pe_ttm")),
-                "pb": _safe_float(row.get("pb")),
-                "ps_ttm": _safe_float(row.get("ps_ttm")),
-                "total_market_value": _safe_float(row.get("total_market_value")),
-                "circulating_market_value": _safe_float(row.get("circulating_market_value")),
-                "dividend_yield": _safe_float(row.get("dividend_yield")),
-            })
-
-        if rows:
-            self._upsert(Valuation, rows, ["stock_code", "trade_date"])
-        logger.info(f"{stock_code} 估值数据写入 {len(rows)} 条")
-        return len(rows)
+        注意：历史估值序列依赖的 AKShare 接口 stock_a_indicator_lg 在当前版本中不可用，
+        该能力已标记为禁用。此方法将立即返回 0，不写入任何数据。
+        最新估值快照请通过 CoreCollector.collect_latest_valuation_snapshot() 获取。
+        """
+        logger.debug(
+            "%s 历史估值数据源不可用: stock_a_indicator_lg 在当前 AKShare 版本中不存在，"
+            "跳过历史估值采集",
+            stock_code,
+        )
+        return 0
 
     # ======================== 分红数据 ========================
 
