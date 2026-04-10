@@ -230,6 +230,38 @@ class AkshareFetcher(BaseFetcher):
                 logger.warning(f"[AkshareFetcher] 163信源失败: {e}")
         return source_name, pd.DataFrame()
 
+    def _fetch_tencent(
+        self, stock_code: str, sd: str, ed: str
+    ) -> Tuple[str, pd.DataFrame]:
+        """腾讯财经信源: ak.stock_zh_a_hist_tx() (如果存在)"""
+        source_name = "akshare_tencent"
+        try:
+            self._enforce_rate_limit()
+            import akshare as ak
+            if not hasattr(ak, "stock_zh_a_hist_tx"):
+                logger.debug("[AkshareFetcher] 腾讯信源接口 stock_zh_a_hist_tx 不存在，跳过")
+                return source_name, pd.DataFrame()
+            # 腾讯接口参数: symbol 为纯6位代码，日期格式 YYYYMMDD
+            logger.info(f"[AkshareFetcher] 腾讯信源 stock_zh_a_hist_tx({stock_code})")
+            t0 = time.time()
+            df = ak.stock_zh_a_hist_tx(
+                symbol=stock_code,
+                start_date=sd,
+                end_date=ed,
+            )
+            elapsed = time.time() - t0
+            if df is not None and not df.empty:
+                self._limiter.record_success()
+                logger.info(f"[AkshareFetcher] 腾讯信源成功: {len(df)} 行, {elapsed:.2f}s")
+                return source_name, df
+        except Exception as e:
+            category = classify_error(e)
+            if category == ErrorCategory.API_SYNTAX:
+                logger.debug(f"[AkshareFetcher] 腾讯信源 API 不兼容: {e}")
+            else:
+                logger.warning(f"[AkshareFetcher] 腾讯信源失败: {e}")
+        return source_name, pd.DataFrame()
+
     # ---- 日K线: 并发多信源 + 交叉校验 ----
 
     def _fetch_raw_data(
@@ -241,7 +273,7 @@ class AkshareFetcher(BaseFetcher):
         """
         并发调用 akshare 支持的所有信源获取日K线数据。
 
-        1. 并发调用: 东方财富 + 新浪 + 163
+        1. 并发调用: 东方财富 + 新浪 + 163 + 腾讯
         2. 收集所有成功返回的数据
         3. 如果多源都有数据，通过 CrossValidator 交叉校验
         4. 返回最佳数据源的数据
@@ -256,13 +288,14 @@ class AkshareFetcher(BaseFetcher):
             (self._fetch_eastmoney, stock_code, sd, ed),
             (self._fetch_sina, stock_code, sd, ed),
             (self._fetch_163, stock_code, sd, ed),
+            (self._fetch_tencent, stock_code, sd, ed),
         ]
 
         source_results: Dict[str, pd.DataFrame] = {}
 
         # 并发调用所有信源
         try:
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ak_src") as executor:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="ak_src") as executor:
                 futures = {
                     executor.submit(fn, code, s, e): fn.__name__
                     for fn, code, s, e in source_tasks

@@ -13,7 +13,7 @@
 
 数据源优先级:
   Priority 0: EfinanceFetcher  (东方财富 efinance 库, 免费无需 Token)
-  Priority 1: AkshareFetcher   (akshare 多信源并发: 东财+新浪+163)
+  Priority 1: AkshareFetcher   (akshare 多信源并发: 东财+新浪+163+腾讯)
   Priority 2: TushareFetcher   (Tushare Pro, 可选 Token)
   Priority 3: BaostockFetcher  (证券宝, 免费, T+1 数据)
   Priority 4: YFinanceFetcher  (Yahoo Finance, 免费)
@@ -42,4 +42,5 @@ __all__ = [
     "DataFetchError",
     "RateLimitError",
     "DataSourceUnavailableError",
+    "FetcherStartupStatus",
 ]

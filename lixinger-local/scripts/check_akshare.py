@@ -57,7 +57,9 @@ def check_all_apis():
             elif key in ("daily_quotes",):
                 result = func(symbol="000001", period="daily", start_date="20240101", end_date="20240110", adjust="qfq")
             elif key in ("financial_income", "financial_balance", "financial_cashflow"):
-                result = func(symbol="000001", symbol_type=config["params"].get("symbol_type", "income"))
+                # 新浪财报: stock=交易所前缀+代码, symbol=中文报表类型
+                report_type = config["params"].get("symbol", "利润表")
+                result = func(stock="sz000001", symbol=report_type)
             elif key == "valuation_indicator":
                 result = func(symbol="000001")
             elif key == "dividends":

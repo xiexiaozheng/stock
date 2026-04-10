@@ -26,6 +26,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,6 +49,33 @@ STANDARD_COLUMNS = ["date", "open", "high", "low", "close", "volume", "amount", 
 
 
 # =====================================================================
+# 启动诊断
+# =====================================================================
+
+@dataclass
+class FetcherStartupStatus:
+    """
+    记录单个 Fetcher 的启动状态。
+
+    用于暴露"哪些框架初始化成功、哪些失败及原因"，
+    使调用方无需猜测某个数据源是否参与了本次请求。
+    """
+    name: str
+    """Fetcher 名称 (e.g. 'TushareFetcher')"""
+
+    available: bool
+    """是否成功注册"""
+
+    priority: Optional[int] = None
+    """注册成功时的优先级"""
+
+    failure_reason: Optional[str] = None
+    """注册失败时的原因描述"""
+
+    def __str__(self) -> str:
+        if self.available:
+            return f"  ✅ {self.name} (priority={self.priority})"
+        return f"  ❌ {self.name}: {self.failure_reason}"
 # 异常层次
 # =====================================================================
 
@@ -352,18 +380,57 @@ class DataFetcherManager:
         self._fetchers_lock = threading.RLock()
         self._stock_name_cache: Dict[str, str] = {}
         self._stock_name_cache_lock = threading.Lock()
+        # 启动诊断: 记录每个 Fetcher 的初始化状态
+        self._startup_statuses: List[FetcherStartupStatus] = []
 
         if fetchers:
             for f in fetchers:
                 self.register_fetcher(f)
         else:
             self._auto_register_fetchers()
+            # 打印启动摘要，方便排查
+            self._log_startup_summary()
+
+    def _log_startup_summary(self) -> None:
+        """打印所有 Fetcher 的启动状态摘要"""
+        available = [s for s in self._startup_statuses if s.available]
+        unavailable = [s for s in self._startup_statuses if not s.available]
+        logger.info(
+            f"[DataFetcherManager] 启动完成: "
+            f"{len(available)} 个数据源可用, {len(unavailable)} 个不可用"
+        )
+        for s in self._startup_statuses:
+            if s.available:
+                logger.info(str(s))
+            else:
+                logger.warning(str(s))
+
+    def get_startup_status(self) -> List[FetcherStartupStatus]:
+        """
+        返回所有 Fetcher 的启动状态列表（包括失败的）。
+
+        调用方可用此方法了解：
+        - 哪些框架成功注册
+        - 哪些框架未能启动以及原因
+        - 每个框架的优先级
+
+        示例::
+
+            manager = DataFetcherManager()
+            for status in manager.get_startup_status():
+                print(status)
+            # ✅ AkshareFetcher (priority=1)
+            # ❌ TushareFetcher: 缺少 TUSHARE_TOKEN 环境变量
+        """
+        return list(self._startup_statuses)
 
     def _auto_register_fetchers(self) -> None:
         """
         自动注册所有可用的 Fetcher（按优先级）。
 
-        如果导入失败（缺少依赖），则跳过该 Fetcher。
+        捕获所有初始化异常（不仅是 ImportError），并记录失败原因到
+        _startup_statuses，确保调用方能看到每个框架是否可用及原因。
+
         注册顺序:
           0. EfinanceFetcher
           1. AkshareFetcher
@@ -383,18 +450,32 @@ class DataFetcherManager:
             if tushare_token:
                 ef.priority = 1
             self.register_fetcher(ef)
+            self._startup_statuses.append(
+                FetcherStartupStatus("EfinanceFetcher", available=True, priority=ef.priority)
+            )
             logger.info(f"[DataFetcherManager] 注册 EfinanceFetcher (priority={ef.priority})")
-        except ImportError as e:
-            logger.warning(f"[DataFetcherManager] EfinanceFetcher 不可用: {e}")
+        except Exception as e:
+            reason = f"efinance 未安装或导入失败: {e}" if isinstance(e, ImportError) else str(e)
+            self._startup_statuses.append(
+                FetcherStartupStatus("EfinanceFetcher", available=False, failure_reason=reason)
+            )
+            logger.warning(f"[DataFetcherManager] EfinanceFetcher 不可用: {reason}")
 
         # Priority 1: AkshareFetcher
         try:
             from data_provider.akshare_fetcher import AkshareFetcher
             af = AkshareFetcher()
             self.register_fetcher(af)
+            self._startup_statuses.append(
+                FetcherStartupStatus("AkshareFetcher", available=True, priority=af.priority)
+            )
             logger.info(f"[DataFetcherManager] 注册 AkshareFetcher (priority={af.priority})")
-        except ImportError as e:
-            logger.warning(f"[DataFetcherManager] AkshareFetcher 不可用: {e}")
+        except Exception as e:
+            reason = f"akshare 未安装或导入失败: {e}" if isinstance(e, ImportError) else str(e)
+            self._startup_statuses.append(
+                FetcherStartupStatus("AkshareFetcher", available=False, failure_reason=reason)
+            )
+            logger.warning(f"[DataFetcherManager] AkshareFetcher 不可用: {reason}")
 
         # Priority 2: TushareFetcher
         try:
@@ -402,46 +483,97 @@ class DataFetcherManager:
             tf = TushareFetcher(token=tushare_token)
             if tushare_token:
                 tf.priority = 0
+            else:
+                logger.info(
+                    "[DataFetcherManager] TushareFetcher 已注册但未配置 TUSHARE_TOKEN, "
+                    "实际请求时将以匿名模式尝试"
+                )
             self.register_fetcher(tf)
+            self._startup_statuses.append(
+                FetcherStartupStatus(
+                    "TushareFetcher",
+                    available=True,
+                    priority=tf.priority,
+                    failure_reason=None if tushare_token else "未配置 TUSHARE_TOKEN (匿名模式, 数据有限)",
+                )
+            )
             logger.info(f"[DataFetcherManager] 注册 TushareFetcher (priority={tf.priority})")
-        except ImportError as e:
-            logger.warning(f"[DataFetcherManager] TushareFetcher 不可用: {e}")
+        except Exception as e:
+            reason = (
+                f"tushare 未安装: {e}" if isinstance(e, ImportError)
+                else f"TushareFetcher 初始化失败: {e}"
+            )
+            self._startup_statuses.append(
+                FetcherStartupStatus("TushareFetcher", available=False, failure_reason=reason)
+            )
+            logger.warning(f"[DataFetcherManager] TushareFetcher 不可用: {reason}")
 
         # Priority 3: BaostockFetcher
         try:
             from data_provider.baostock_fetcher import BaostockFetcher
             bf = BaostockFetcher()
             self.register_fetcher(bf)
+            self._startup_statuses.append(
+                FetcherStartupStatus("BaostockFetcher", available=True, priority=bf.priority)
+            )
             logger.info(f"[DataFetcherManager] 注册 BaostockFetcher (priority={bf.priority})")
-        except ImportError as e:
-            logger.warning(f"[DataFetcherManager] BaostockFetcher 不可用: {e}")
+        except Exception as e:
+            reason = f"baostock 未安装: {e}" if isinstance(e, ImportError) else str(e)
+            self._startup_statuses.append(
+                FetcherStartupStatus("BaostockFetcher", available=False, failure_reason=reason)
+            )
+            logger.warning(f"[DataFetcherManager] BaostockFetcher 不可用: {reason}")
 
         # Priority 4: YFinanceFetcher
         try:
             from data_provider.yfinance_fetcher import YFinanceFetcher
             yf = YFinanceFetcher()
             self.register_fetcher(yf)
+            self._startup_statuses.append(
+                FetcherStartupStatus("YFinanceFetcher", available=True, priority=yf.priority)
+            )
             logger.info(f"[DataFetcherManager] 注册 YFinanceFetcher (priority={yf.priority})")
-        except ImportError as e:
-            logger.debug(f"[DataFetcherManager] YFinanceFetcher 不可用: {e}")
+        except Exception as e:
+            reason = f"yfinance 未安装: {e}" if isinstance(e, ImportError) else str(e)
+            self._startup_statuses.append(
+                FetcherStartupStatus("YFinanceFetcher", available=False, failure_reason=reason)
+            )
+            logger.debug(f"[DataFetcherManager] YFinanceFetcher 不可用: {reason}")
 
         # Priority 5: LongbridgeFetcher
         try:
             from data_provider.longbridge_fetcher import LongbridgeFetcher
             lb = LongbridgeFetcher()
             self.register_fetcher(lb)
+            self._startup_statuses.append(
+                FetcherStartupStatus("LongbridgeFetcher", available=True, priority=lb.priority)
+            )
             logger.info(f"[DataFetcherManager] 注册 LongbridgeFetcher (priority={lb.priority})")
-        except ImportError as e:
-            logger.debug(f"[DataFetcherManager] LongbridgeFetcher 不可用: {e}")
+        except Exception as e:
+            reason = (
+                f"longport 未安装: {e}" if isinstance(e, ImportError)
+                else f"LongbridgeFetcher 初始化失败 (可能缺少 LONGBRIDGE_APP_KEY 等环境变量): {e}"
+            )
+            self._startup_statuses.append(
+                FetcherStartupStatus("LongbridgeFetcher", available=False, failure_reason=reason)
+            )
+            logger.debug(f"[DataFetcherManager] LongbridgeFetcher 不可用: {reason}")
 
         # Priority 6: EastmoneyFetcher
         try:
             from data_provider.eastmoney_fetcher import EastmoneyFetcher
             em = EastmoneyFetcher()
             self.register_fetcher(em)
+            self._startup_statuses.append(
+                FetcherStartupStatus("EastmoneyFetcher", available=True, priority=em.priority)
+            )
             logger.info(f"[DataFetcherManager] 注册 EastmoneyFetcher (priority={em.priority})")
-        except ImportError as e:
-            logger.debug(f"[DataFetcherManager] EastmoneyFetcher 不可用: {e}")
+        except Exception as e:
+            reason = str(e)
+            self._startup_statuses.append(
+                FetcherStartupStatus("EastmoneyFetcher", available=False, failure_reason=reason)
+            )
+            logger.debug(f"[DataFetcherManager] EastmoneyFetcher 不可用: {reason}")
 
     def register_fetcher(self, fetcher: BaseFetcher) -> None:
         """注册一个 Fetcher 并按优先级排序"""
