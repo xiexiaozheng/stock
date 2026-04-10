@@ -1,7 +1,5 @@
 """
-多数据源 Fetcher 基类与 Manager
-
-参考 ZhuLinsen/daily_stock_analysis data_provider/base.py
+多数据源 Fetcher 基类与 Manager (并发多源 + 交叉校验版)
 
 BaseFetcher: 所有数据源实现的抽象基类
   - _fetch_raw_data() / _normalize_data(): 子类必须实现
@@ -10,15 +8,24 @@ BaseFetcher: 所有数据源实现的抽象基类
   - 内置 random_sleep, _clean_data, _calculate_indicators
 
 DataFetcherManager: 策略管理器
-  - 自动按优先级 failover
+  - 支持并发多源获取 (get_daily_data_concurrent)
+  - 多数据源交叉校验 (CrossValidator)
+  - 自动按优先级 failover (兼容旧模式)
   - 多数据源字段补充
   - 线程安全
+
+改造说明:
+  - 新增 get_daily_data_concurrent(): 并发调用所有可用 Fetcher
+  - get_daily_data() 增加 concurrent 参数开关
+  - 注册新数据源: YFinance, Longbridge, Eastmoney
+  - 使用 error_classifier 智能分类错误
 """
 import logging
 import random
 import threading
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -315,17 +322,27 @@ class BaseFetcher(ABC):
 
 class DataFetcherManager:
     """
-    多数据源管理器
+    多数据源管理器 (并发多源 + 交叉校验版)
 
-    参考 daily_stock_analysis DataFetcherManager 设计:
-    - 管理所有 Fetcher 实例
-    - 按优先级自动 failover
-    - 实时行情多源补充
-    - 线程安全
+    支持两种模式:
+    1. 并发模式 (concurrent=True, 默认): 并发调用所有可用 Fetcher，
+       收集结果后交叉校验，返回最佳数据
+    2. 顺序 failover 模式 (concurrent=False): 按优先级顺序尝试，
+       第一个成功的直接返回
+
+    管理所有 Fetcher 实例:
+    - EfinanceFetcher (东方财富 efinance)
+    - AkshareFetcher (akshare 多信源并发)
+    - TushareFetcher (Tushare Pro)
+    - BaostockFetcher (证券宝)
+    - YFinanceFetcher (Yahoo Finance)
+    - LongbridgeFetcher (长桥)
+    - EastmoneyFetcher (东财直连)
 
     用法:
         manager = DataFetcherManager()
-        df, source = manager.get_daily_data('600519')
+        df, source = manager.get_daily_data('600519')  # 默认并发模式
+        df, source = manager.get_daily_data('600519', concurrent=False)  # 旧模式
         quote = manager.get_realtime_quote('600519')
         manager.close()
     """
@@ -347,6 +364,14 @@ class DataFetcherManager:
         自动注册所有可用的 Fetcher（按优先级）。
 
         如果导入失败（缺少依赖），则跳过该 Fetcher。
+        注册顺序:
+          0. EfinanceFetcher
+          1. AkshareFetcher
+          2. TushareFetcher
+          3. BaostockFetcher
+          4. YFinanceFetcher
+          5. LongbridgeFetcher
+          6. EastmoneyFetcher
         """
         import os
         tushare_token = os.getenv("TUSHARE_TOKEN", "")
@@ -356,7 +381,7 @@ class DataFetcherManager:
             from data_provider.efinance_fetcher import EfinanceFetcher
             ef = EfinanceFetcher()
             if tushare_token:
-                ef.priority = 1  # 有 Tushare Token 时降低优先级 (数值越大优先级越低)
+                ef.priority = 1
             self.register_fetcher(ef)
             logger.info(f"[DataFetcherManager] 注册 EfinanceFetcher (priority={ef.priority})")
         except ImportError as e:
@@ -376,7 +401,7 @@ class DataFetcherManager:
             from data_provider.tushare_fetcher import TushareFetcher
             tf = TushareFetcher(token=tushare_token)
             if tushare_token:
-                tf.priority = 0  # 有 Token 时提升到最高优先级
+                tf.priority = 0
             self.register_fetcher(tf)
             logger.info(f"[DataFetcherManager] 注册 TushareFetcher (priority={tf.priority})")
         except ImportError as e:
@@ -391,6 +416,33 @@ class DataFetcherManager:
         except ImportError as e:
             logger.warning(f"[DataFetcherManager] BaostockFetcher 不可用: {e}")
 
+        # Priority 4: YFinanceFetcher
+        try:
+            from data_provider.yfinance_fetcher import YFinanceFetcher
+            yf = YFinanceFetcher()
+            self.register_fetcher(yf)
+            logger.info(f"[DataFetcherManager] 注册 YFinanceFetcher (priority={yf.priority})")
+        except ImportError as e:
+            logger.debug(f"[DataFetcherManager] YFinanceFetcher 不可用: {e}")
+
+        # Priority 5: LongbridgeFetcher
+        try:
+            from data_provider.longbridge_fetcher import LongbridgeFetcher
+            lb = LongbridgeFetcher()
+            self.register_fetcher(lb)
+            logger.info(f"[DataFetcherManager] 注册 LongbridgeFetcher (priority={lb.priority})")
+        except ImportError as e:
+            logger.debug(f"[DataFetcherManager] LongbridgeFetcher 不可用: {e}")
+
+        # Priority 6: EastmoneyFetcher
+        try:
+            from data_provider.eastmoney_fetcher import EastmoneyFetcher
+            em = EastmoneyFetcher()
+            self.register_fetcher(em)
+            logger.info(f"[DataFetcherManager] 注册 EastmoneyFetcher (priority={em.priority})")
+        except ImportError as e:
+            logger.debug(f"[DataFetcherManager] EastmoneyFetcher 不可用: {e}")
+
     def register_fetcher(self, fetcher: BaseFetcher) -> None:
         """注册一个 Fetcher 并按优先级排序"""
         with self._fetchers_lock:
@@ -402,7 +454,7 @@ class DataFetcherManager:
         with self._fetchers_lock:
             return list(self._fetchers)
 
-    # ---- 日K线数据（自动 failover）----
+    # ---- 日K线数据（并发多源 + 交叉校验）----
 
     def get_daily_data(
         self,
@@ -410,11 +462,164 @@ class DataFetcherManager:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         days: int = 30,
+        concurrent: bool = True,
     ) -> Tuple[pd.DataFrame, str]:
         """
-        获取日K线数据，自动按优先级尝试所有 Fetcher。
+        获取日K线数据。
 
-        :return: (DataFrame, fetcher_name) 成功返回数据和来源名称
+        :param concurrent: True=并发多源+交叉校验, False=按优先级 failover
+        :return: (DataFrame, source_name)
+        :raises DataFetchError: 所有数据源都失败时
+        """
+        if concurrent:
+            return self.get_daily_data_concurrent(
+                stock_code, start_date, end_date, days
+            )
+        return self._get_daily_data_failover(
+            stock_code, start_date, end_date, days
+        )
+
+    def get_daily_data_concurrent(
+        self,
+        stock_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30,
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        并发调用所有可用 Fetcher 获取日K线数据。
+
+        流程:
+        1. 并发调用所有未熔断的 Fetcher
+        2. 收集所有成功返回的结果
+        3. 如果多源都有数据，通过 CrossValidator 交叉校验
+        4. 返回最佳数据源的数据
+
+        :return: (DataFrame, source_info_string)
+        """
+        from data_provider.cross_validator import CrossValidator
+        from data_provider.error_classifier import classify_error, ErrorCategory
+
+        # 从配置获取超时值
+        try:
+            from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
+        except ImportError:
+            CONCURRENT_FETCH_TIMEOUT = 120.0
+            CONCURRENT_MAX_WORKERS = 7
+
+        circuit_breaker = get_daily_circuit_breaker()
+        fetchers = self.get_fetchers()
+        errors: List[str] = []
+        source_results: Dict[str, pd.DataFrame] = {}
+
+        def _fetch_from_source(fetcher: BaseFetcher) -> Tuple[str, pd.DataFrame]:
+            """从单个数据源获取数据"""
+            source_key = f"daily_{fetcher.name}"
+            if not circuit_breaker.is_available(source_key):
+                return fetcher.name, pd.DataFrame()
+            try:
+                df = fetcher.get_daily_data(
+                    stock_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    days=days,
+                )
+                if df is not None and not df.empty:
+                    circuit_breaker.record_success(source_key)
+                    return fetcher.name, df
+                circuit_breaker.record_inconclusive(source_key)
+                return fetcher.name, pd.DataFrame()
+            except Exception as e:
+                category = classify_error(e)
+                if category == ErrorCategory.API_SYNTAX:
+                    logger.error(
+                        f"[DataFetcherManager] {fetcher.name} API 语法错误: {e}"
+                    )
+                elif category == ErrorCategory.ANTI_CRAWL:
+                    logger.warning(
+                        f"[DataFetcherManager] {fetcher.name} 反爬虫错误: {e}"
+                    )
+                circuit_breaker.record_failure(source_key, str(e))
+                return fetcher.name, pd.DataFrame()
+
+        # 并发调用所有 Fetcher
+        try:
+            max_workers = min(len(fetchers), CONCURRENT_MAX_WORKERS)
+            with ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="daily_src",
+            ) as executor:
+                futures = {
+                    executor.submit(_fetch_from_source, f): f.name
+                    for f in fetchers
+                }
+                for future in as_completed(futures, timeout=CONCURRENT_FETCH_TIMEOUT):
+                    try:
+                        name, df = future.result(timeout=CONCURRENT_FETCH_TIMEOUT / 2)
+                        if df is not None and not df.empty:
+                            source_results[name] = df
+                        elif name:
+                            errors.append(f"{name}: 返回空数据")
+                    except Exception as e:
+                        fetcher_name = futures[future]
+                        errors.append(f"{fetcher_name}: {e}")
+        except Exception as e:
+            logger.warning(
+                f"[DataFetcherManager] 并发执行异常，降级为 failover: {e}"
+            )
+            return self._get_daily_data_failover(
+                stock_code, start_date, end_date, days
+            )
+
+        if not source_results:
+            raise DataFetchError(
+                f"所有数据源获取 {stock_code} 日K线均失败 (并发模式):\n"
+                + "\n".join(f"  - {e}" for e in errors)
+            )
+
+        # 单源直接返回
+        if len(source_results) == 1:
+            source_name = next(iter(source_results))
+            df = source_results[source_name]
+            logger.info(
+                f"[DataFetcherManager] {stock_code} 日K线仅 {source_name} 返回 {len(df)} 行"
+            )
+            return df, source_name
+
+        # 多源交叉校验
+        validator = CrossValidator()
+        report = validator.validate_daily_data(source_results)
+
+        sources_info = (
+            f"concurrent({len(source_results)}源: "
+            f"{','.join(source_results.keys())}|"
+            f"best={report.best_source}|"
+            f"score={report.consistency_score:.4f})"
+        )
+        logger.info(
+            f"[DataFetcherManager] {stock_code} 并发校验完成: {sources_info}"
+        )
+
+        # 优先使用融合数据 (中位数), 次之用最佳源
+        if report.merged_dataframe is not None and not report.merged_dataframe.empty:
+            return report.merged_dataframe, sources_info
+        if report.best_dataframe is not None and not report.best_dataframe.empty:
+            return report.best_dataframe, sources_info
+        # 兜底: 返回第一个
+        first_name = next(iter(source_results))
+        return source_results[first_name], first_name
+
+    def _get_daily_data_failover(
+        self,
+        stock_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        days: int = 30,
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        原有的按优先级顺序 failover 模式。
+
+        :return: (DataFrame, fetcher_name)
         :raises DataFetchError: 所有数据源都失败时
         """
         circuit_breaker = get_daily_circuit_breaker()

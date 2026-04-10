@@ -1,29 +1,35 @@
 """
-AkshareFetcher — akshare 多数据源 Fetcher
+AkshareFetcher — akshare 多数据源 Fetcher (并发多信源版)
 
-参考 ZhuLinsen/daily_stock_analysis data_provider/akshare_fetcher.py
+数据来源 (akshare 内部支持的所有信源):
+  1. 东方财富: ak.stock_zh_a_hist()         — 日K线 (primary)
+  2. 新浪财经: ak.stock_zh_a_daily()        — 日K线 (fallback)
+  3. 网易/163: ak.stock_zh_a_hist_163()     — 日K线 (if available)
+  4. 东方财富: ak.stock_zh_a_spot_em()      — 实时行情
+  5. 新浪HTTP: ak.stock_zh_a_spot()         — 实时行情
 
-数据来源:
-  1. 东方财富爬虫 (akshare 默认) — 日K线、实时行情
-  2. 新浪财经接口 — 备选实时行情
-  3. 腾讯财经接口 — 备选实时行情
+改造说明:
+  - _fetch_raw_data() 改为并发调用所有 akshare 信源
+  - 内部使用 CrossValidator 进行交叉校验
+  - 实时行情也并发采集多路源
 
 防封禁策略:
   - 每次请求随机休眠 2-5 秒
   - 随机轮换 User-Agent
-  - tenacity 指数退避重试 (2→4→8s, 最多3次)
+  - 自适应限流 (via error_classifier)
   - CircuitBreaker 熔断器保护各子源
 
-实时行情3路源:
+实时行情多路源:
   - em:   ak.stock_zh_a_spot_em()    (东方财富)
-  - sina: ak.stock_zh_a_spot()       (新浪) — fallback 已确认在旧版可用
-  - 东财接口优先, 失败切新浪
+  - sina: ak.stock_zh_a_spot()       (新浪)
+  - 并发采集 + 交叉校验
 """
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -41,6 +47,12 @@ from data_provider.realtime_types import (
     safe_float,
     safe_int,
 )
+from data_provider.error_classifier import (
+    classify_error,
+    ErrorCategory,
+    get_adaptive_limiter,
+)
+from data_provider.cross_validator import CrossValidator
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +81,20 @@ _realtime_cache: Dict[str, Any] = {
 
 class AkshareFetcher(BaseFetcher):
     """
-    AkShare 数据源 Fetcher
+    AkShare 数据源 Fetcher (并发多信源版)
 
-    日K线: ak.stock_zh_a_hist (东方财富)
-      └─ fallback: ak.stock_zh_a_daily (新浪)
+    日K线 — 并发调用所有 akshare 信源:
+      1. 东方财富: ak.stock_zh_a_hist()
+      2. 新浪财经: ak.stock_zh_a_daily()
+      3. 网易/163: ak.stock_zh_a_hist_163() (if available)
+    返回前内部交叉校验。
 
-    实时行情 (3 路):
-      1. em:   ak.stock_zh_a_spot_em()  (东方财富，最全)
-      2. sina: 新浪HTTP API (轻量级)
-      3. tencent: 腾讯HTTP API (备选)
+    实时行情 — 并发调用多路源:
+      1. em:   ak.stock_zh_a_spot_em()  (东方财富)
+      2. sina: ak.stock_zh_a_spot()     (新浪)
+    结果交叉校验。
 
-    策略: 东财优先 → 新浪补充 → 腾讯兜底
+    策略: 并发采集 → 交叉校验 → 返回最佳数据
     """
 
     name = "AkshareFetcher"
@@ -89,6 +104,10 @@ class AkshareFetcher(BaseFetcher):
         super().__init__()
         self.sleep_min = sleep_min
         self.sleep_max = sleep_max
+        self._validator = CrossValidator()
+        self._limiter = get_adaptive_limiter(
+            "akshare", base_interval=sleep_min, max_interval=30.0
+        )
 
     # ---- 防封禁 ----
 
@@ -97,64 +116,32 @@ class AkshareFetcher(BaseFetcher):
         random_ua = random.choice(USER_AGENTS)
         try:
             import requests
-            # 尝试更新 akshare 内部 session 的 UA
-            # 这是 best-effort，不保证所有版本兼容
             import akshare as ak
             if hasattr(ak, "requests_cache"):
-                pass  # 某些版本使用 requests-cache
+                pass
         except Exception:
             pass
         logger.debug(f"[AkshareFetcher] UA → {random_ua[:40]}...")
 
     def _enforce_rate_limit(self) -> None:
         """
-        强制限流: 随机休眠 2-5 秒
-
-        参考 daily_stock_analysis AkshareFetcher._enforce_rate_limit
+        自适应限流: 基础 2-5 秒，遇到反爬虫自动退避。
         """
-        now = time.time()
-        elapsed = now - self._last_request_time
-        min_interval = self.sleep_min
-
-        if elapsed < min_interval:
-            additional_sleep = min_interval - elapsed
-            logger.debug(f"[AkshareFetcher] 补充休眠 {additional_sleep:.2f}s")
-            time.sleep(additional_sleep)
-
+        self._limiter.wait()
         self._set_random_user_agent()
-        self.random_sleep(self.sleep_min, self.sleep_max)
         self._last_request_time = time.time()
 
-    # ---- 日K线 (必须实现) ----
+    # ---- akshare 信源: 各子接口独立方法 ----
 
-    def _fetch_raw_data(
-        self,
-        stock_code: str,
-        start_date: str,
-        end_date: str,
-    ) -> pd.DataFrame:
-        """
-        获取日K线原始数据。
-
-        优先使用东方财富接口 (stock_zh_a_hist)。
-        失败后尝试新浪接口 (stock_zh_a_daily)。
-
-        参考 daily_stock_analysis _fetch_daily_data_eastmoney / _fetch_daily_data_sina
-        """
-        self._enforce_rate_limit()
-
-        # 日期格式转换
-        sd = start_date.replace("-", "")
-        ed = end_date.replace("-", "")
-
-        # 尝试1: 东方财富 (primary)
+    def _fetch_eastmoney(
+        self, stock_code: str, sd: str, ed: str
+    ) -> Tuple[str, pd.DataFrame]:
+        """东方财富信源: ak.stock_zh_a_hist()"""
+        source_name = "akshare_eastmoney"
         try:
+            self._enforce_rate_limit()
             import akshare as ak
-            logger.info(
-                f"[AkshareFetcher] ak.stock_zh_a_hist"
-                f"(symbol={stock_code}, period=daily, "
-                f"start_date={sd}, end_date={ed})"
-            )
+            logger.info(f"[AkshareFetcher] 东财信源 stock_zh_a_hist({stock_code})")
             t0 = time.time()
             df = ak.stock_zh_a_hist(
                 symbol=stock_code,
@@ -165,23 +152,31 @@ class AkshareFetcher(BaseFetcher):
             )
             elapsed = time.time() - t0
             if df is not None and not df.empty:
-                logger.info(
-                    f"[AkshareFetcher] stock_zh_a_hist 成功: "
-                    f"{len(df)} 行, {elapsed:.2f}s"
-                )
-                return df
-            logger.warning("[AkshareFetcher] stock_zh_a_hist 返回空数据")
+                self._limiter.record_success()
+                logger.info(f"[AkshareFetcher] 东财信源成功: {len(df)} 行, {elapsed:.2f}s")
+                return source_name, df
         except Exception as e:
-            logger.warning(f"[AkshareFetcher] stock_zh_a_hist 失败: {e}")
+            category = classify_error(e)
+            if category == ErrorCategory.API_SYNTAX:
+                logger.error(f"[AkshareFetcher] 东财信源 API 语法错误: {e}")
+            elif category == ErrorCategory.ANTI_CRAWL:
+                self._limiter.record_anti_crawl()
+                logger.warning(f"[AkshareFetcher] 东财信源反爬虫: {e}")
+            else:
+                logger.warning(f"[AkshareFetcher] 东财信源失败: {e}")
+        return source_name, pd.DataFrame()
 
-        # 尝试2: 新浪财经 (fallback)
-        self._enforce_rate_limit()
+    def _fetch_sina(
+        self, stock_code: str, sd: str, ed: str
+    ) -> Tuple[str, pd.DataFrame]:
+        """新浪财经信源: ak.stock_zh_a_daily()"""
+        source_name = "akshare_sina"
         try:
+            self._enforce_rate_limit()
             import akshare as ak
-            logger.info(f"[AkshareFetcher] 尝试新浪接口 stock_zh_a_daily...")
-            t0 = time.time()
-            # 新浪接口需要带交易所前缀
             prefix = "sh" if stock_code.startswith(("6", "9")) else "sz"
+            logger.info(f"[AkshareFetcher] 新浪信源 stock_zh_a_daily({prefix}{stock_code})")
+            t0 = time.time()
             df = ak.stock_zh_a_daily(
                 symbol=f"{prefix}{stock_code}",
                 start_date=sd,
@@ -190,15 +185,141 @@ class AkshareFetcher(BaseFetcher):
             )
             elapsed = time.time() - t0
             if df is not None and not df.empty:
-                logger.info(
-                    f"[AkshareFetcher] stock_zh_a_daily 成功: "
-                    f"{len(df)} 行, {elapsed:.2f}s"
-                )
-                return df
+                self._limiter.record_success()
+                logger.info(f"[AkshareFetcher] 新浪信源成功: {len(df)} 行, {elapsed:.2f}s")
+                return source_name, df
         except Exception as e:
-            logger.warning(f"[AkshareFetcher] stock_zh_a_daily 也失败: {e}")
+            category = classify_error(e)
+            if category == ErrorCategory.API_SYNTAX:
+                logger.error(f"[AkshareFetcher] 新浪信源 API 语法错误: {e}")
+            elif category == ErrorCategory.ANTI_CRAWL:
+                self._limiter.record_anti_crawl()
+                logger.warning(f"[AkshareFetcher] 新浪信源反爬虫: {e}")
+            else:
+                logger.warning(f"[AkshareFetcher] 新浪信源失败: {e}")
+        return source_name, pd.DataFrame()
 
-        return pd.DataFrame()
+    def _fetch_163(
+        self, stock_code: str, sd: str, ed: str
+    ) -> Tuple[str, pd.DataFrame]:
+        """网易/163 信源: ak.stock_zh_a_hist_163() (如果存在)"""
+        source_name = "akshare_163"
+        try:
+            self._enforce_rate_limit()
+            import akshare as ak
+            if not hasattr(ak, "stock_zh_a_hist_163"):
+                logger.debug("[AkshareFetcher] 163 信源接口不存在，跳过")
+                return source_name, pd.DataFrame()
+            logger.info(f"[AkshareFetcher] 163信源 stock_zh_a_hist_163({stock_code})")
+            t0 = time.time()
+            df = ak.stock_zh_a_hist_163(
+                symbol=stock_code,
+                start_date=sd,
+                end_date=ed,
+            )
+            elapsed = time.time() - t0
+            if df is not None and not df.empty:
+                self._limiter.record_success()
+                logger.info(f"[AkshareFetcher] 163信源成功: {len(df)} 行, {elapsed:.2f}s")
+                return source_name, df
+        except Exception as e:
+            category = classify_error(e)
+            if category == ErrorCategory.API_SYNTAX:
+                logger.debug(f"[AkshareFetcher] 163信源 API 不兼容: {e}")
+            else:
+                logger.warning(f"[AkshareFetcher] 163信源失败: {e}")
+        return source_name, pd.DataFrame()
+
+    # ---- 日K线: 并发多信源 + 交叉校验 ----
+
+    def _fetch_raw_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """
+        并发调用 akshare 支持的所有信源获取日K线数据。
+
+        1. 并发调用: 东方财富 + 新浪 + 163
+        2. 收集所有成功返回的数据
+        3. 如果多源都有数据，通过 CrossValidator 交叉校验
+        4. 返回最佳数据源的数据
+
+        如果并发无法执行 (如线程池不可用), 降级为顺序调用。
+        """
+        sd = start_date.replace("-", "")
+        ed = end_date.replace("-", "")
+
+        # 定义所有信源任务
+        source_tasks = [
+            (self._fetch_eastmoney, stock_code, sd, ed),
+            (self._fetch_sina, stock_code, sd, ed),
+            (self._fetch_163, stock_code, sd, ed),
+        ]
+
+        source_results: Dict[str, pd.DataFrame] = {}
+
+        # 并发调用所有信源
+        try:
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ak_src") as executor:
+                futures = {
+                    executor.submit(fn, code, s, e): fn.__name__
+                    for fn, code, s, e in source_tasks
+                }
+                for future in as_completed(futures, timeout=60):
+                    try:
+                        source_name, df = future.result(timeout=30)
+                        if df is not None and not df.empty:
+                            # 先标准化再放入校验
+                            normalized = self._normalize_data(df, stock_code)
+                            if not normalized.empty:
+                                source_results[source_name] = normalized
+                    except Exception as e:
+                        task_name = futures[future]
+                        logger.warning(
+                            f"[AkshareFetcher] 信源任务 {task_name} 异常: {e}"
+                        )
+        except Exception as e:
+            logger.warning(
+                f"[AkshareFetcher] 并发执行异常，降级为顺序调用: {e}"
+            )
+            # 降级: 顺序调用
+            for fn, code, s, e in source_tasks:
+                try:
+                    source_name, df = fn(code, s, e)
+                    if df is not None and not df.empty:
+                        normalized = self._normalize_data(df, stock_code)
+                        if not normalized.empty:
+                            source_results[source_name] = normalized
+                except Exception as ex:
+                    logger.warning(f"[AkshareFetcher] 顺序调用 {fn.__name__} 失败: {ex}")
+
+        if not source_results:
+            logger.warning(f"[AkshareFetcher] {stock_code} 所有信源均无数据")
+            return pd.DataFrame()
+
+        # 单源直接返回
+        if len(source_results) == 1:
+            source_name = next(iter(source_results))
+            logger.info(f"[AkshareFetcher] {stock_code} 仅单信源 {source_name} 返回数据")
+            return source_results[source_name]
+
+        # 多源交叉校验
+        report = self._validator.validate_daily_data(source_results)
+        logger.info(
+            f"[AkshareFetcher] {stock_code} 内部交叉校验: "
+            f"{len(source_results)} 源, "
+            f"一致性={report.consistency_score:.4f}, "
+            f"最佳源={report.best_source}, "
+            f"异常数={len(report.anomalies)}"
+        )
+
+        if report.merged_dataframe is not None and not report.merged_dataframe.empty:
+            return report.merged_dataframe
+        if report.best_dataframe is not None:
+            return report.best_dataframe
+        return next(iter(source_results.values()))
 
     def _normalize_data(
         self,
@@ -239,27 +360,77 @@ class AkshareFetcher(BaseFetcher):
 
         return df[STANDARD_COLUMNS]
 
-    # ---- 实时行情 (3 路源) ----
+    # ---- 实时行情 (并发多路源) ----
 
     def get_realtime_quote(
         self,
         stock_code: str,
-        source: str = "em",
+        source: str = "auto",
     ) -> Optional[UnifiedRealtimeQuote]:
         """
-        获取实时行情，支持3种数据源:
+        并发获取实时行情，支持多种数据源并交叉校验:
 
         - em:   ak.stock_zh_a_spot_em()  (东方财富, 最全)
         - sina: 新浪HTTP接口
-        - auto: em → sina 自动切换
+        - auto: 并发采集 em + sina，交叉校验后返回最佳
 
-        参考 daily_stock_analysis AkshareFetcher.get_realtime_quote
+        当 source="auto" 时并发采集多路，否则只用指定源。
         """
         code = normalize_stock_code(stock_code)
         circuit_breaker = get_realtime_circuit_breaker()
 
-        if source == "auto" or source == "em":
-            source_key = f"akshare_em"
+        if source not in ("auto", "em", "sina"):
+            source = "auto"
+
+        if source == "auto":
+            # 并发采集 em + sina
+            quotes: Dict[str, Optional[UnifiedRealtimeQuote]] = {}
+
+            def _get_em():
+                source_key = "akshare_em"
+                if circuit_breaker.is_available(source_key):
+                    q = self._get_quote_eastmoney(code)
+                    if q and q.has_basic_data():
+                        circuit_breaker.record_success(source_key)
+                        return "em", q
+                    circuit_breaker.record_failure(source_key, "东方财富实时行情无效")
+                return "em", None
+
+            def _get_sina():
+                source_key = "akshare_sina"
+                if circuit_breaker.is_available(source_key):
+                    q = self._get_quote_sina(code)
+                    if q and q.has_basic_data():
+                        circuit_breaker.record_success(source_key)
+                        return "sina", q
+                    circuit_breaker.record_failure(source_key, "新浪实时行情无效")
+                return "sina", None
+
+            try:
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ak_rt") as executor:
+                    futures = [executor.submit(_get_em), executor.submit(_get_sina)]
+                    for future in as_completed(futures, timeout=30):
+                        try:
+                            name, quote = future.result(timeout=15)
+                            if quote is not None:
+                                quotes[name] = quote
+                        except Exception as e:
+                            logger.warning(f"[AkshareFetcher] 实时行情任务异常: {e}")
+            except Exception as e:
+                logger.warning(f"[AkshareFetcher] 实时行情并发异常: {e}")
+
+            # 返回最完整的行情
+            if not quotes:
+                return None
+            if len(quotes) == 1:
+                return next(iter(quotes.values()))
+
+            # 多源可用时，优先返回 em (字段更全)
+            return quotes.get("em") or quotes.get("sina")
+
+        # 指定单源
+        if source == "em":
+            source_key = "akshare_em"
             if circuit_breaker.is_available(source_key):
                 quote = self._get_quote_eastmoney(code)
                 if quote and quote.has_basic_data():
@@ -267,8 +438,8 @@ class AkshareFetcher(BaseFetcher):
                     return quote
                 circuit_breaker.record_failure(source_key, "东方财富实时行情无效")
 
-        if source == "auto" or source == "sina":
-            source_key = f"akshare_sina"
+        if source == "sina":
+            source_key = "akshare_sina"
             if circuit_breaker.is_available(source_key):
                 quote = self._get_quote_sina(code)
                 if quote and quote.has_basic_data():

@@ -1,18 +1,20 @@
 """
-核心数据采集模块 — 多数据源版
+核心数据采集模块 — 并发多源 + 交叉校验版
 
 负责从多个数据源获取数据并写入三张核心表：
 1. StockBasic - 股票基础信息
 2. DailyMarketValuation - 日度量价与估值
 3. QuarterlyFinance - 季度财务核心
 
-参考 ZhuLinsen/daily_stock_analysis 的多信源数据获取架构：
-- 日K线行情: 通过 DataFetcherManager 自动 failover (efinance → akshare → tushare → baostock)
+多数据源架构 (并发多源采集):
+- 日K线行情: 通过 DataFetcherManager 并发调用所有 Fetcher
+  (efinance/akshare/tushare/baostock/yfinance/longbridge/eastmoney)
+  + 交叉校验，返回最佳数据
 - 估值指标: 通过 api_compat.call_akshare() 兼容层
 - 后复权因子: 通过 BaostockFetcher 专有接口
 - 财务数据: 通过 api_compat.call_akshare() + FundamentalAdapter 补充
 
-所有数据源接口都有独立的防封禁策略 (限流、熔断器、UA轮换、重试)。
+所有数据源接口都有独立的防封禁策略 (自适应限流、熔断器、UA轮换、重试)。
 """
 import logging
 import time
@@ -27,7 +29,10 @@ from collectors.base import BaseCollector
 from models.core import StockBasic, DailyMarketValuation, QuarterlyFinance
 from utils.api_compat import call_akshare, AkshareAPIError
 from utils.logger import get_logger
-from config import HISTORY_YEARS_QUOTES, HISTORY_YEARS_FINANCIALS, HISTORY_YEARS_VALUATIONS
+from config import (
+    HISTORY_YEARS_QUOTES, HISTORY_YEARS_FINANCIALS, HISTORY_YEARS_VALUATIONS,
+    CONCURRENT_FETCH_ENABLED,
+)
 
 # 多数据源框架
 from data_provider.base import DataFetcherManager, DataFetchError, normalize_stock_code
@@ -88,11 +93,17 @@ def _ts_code_to_pure(ts_code: str) -> str:
 
 class CoreCollector(BaseCollector):
     """
-    核心数据采集器 — 多数据源版
+    核心数据采集器 — 并发多源 + 交叉校验版
 
     负责采集三张核心表的数据，支持增量和全量更新。
-    日K线行情通过 DataFetcherManager 多数据源自动 failover 获取。
+    日K线行情通过 DataFetcherManager 并发多源获取 + 交叉校验。
     估值、财务数据通过 api_compat + FundamentalAdapter 多接口探测获取。
+
+    数据源:
+    - 日K线: efinance/akshare(东财+新浪+163)/tushare/baostock/yfinance/longbridge/eastmoney
+    - 估值: akshare (stock_a_indicator_lg)
+    - 复权因子: baostock (专有)
+    - 财务: akshare + FundamentalAdapter
     """
 
     def __init__(self, db: Session, manager: Optional[DataFetcherManager] = None):
@@ -245,7 +256,7 @@ class CoreCollector(BaseCollector):
         start_dash = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
         end_dash = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
 
-        # ---- 数据源1: 日K线行情（多数据源 failover）----
+        # ---- 数据源1: 日K线行情（并发多源 + 交叉校验）----
         quotes_data = {}
         data_source = "none"
         try:
@@ -254,6 +265,7 @@ class CoreCollector(BaseCollector):
                 start_date=start_dash,
                 end_date=end_dash,
                 days=0,  # 不限天数，用日期范围控制
+                concurrent=CONCURRENT_FETCH_ENABLED,
             )
             if df_quotes is not None and not df_quotes.empty:
                 logger.info(

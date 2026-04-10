@@ -21,7 +21,48 @@ AKSHARE_REQUEST_INTERVAL = float(os.getenv("AKSHARE_REQUEST_INTERVAL", "0.8"))  
 AKSHARE_MAX_RETRIES = int(os.getenv("AKSHARE_MAX_RETRIES", "3"))
 CHROME_MCP_INTERVAL = float(os.getenv("CHROME_MCP_INTERVAL", "3.0"))  # 秒
 
-# 数据采集配置 — 多数据源 (参考 daily_stock_analysis)
+# =====================================================================
+# 并发多源采集配置
+# =====================================================================
+
+# 主开关: 是否启用并发多源采集 (True=并发+交叉校验, False=顺序failover)
+CONCURRENT_FETCH_ENABLED = os.getenv("CONCURRENT_FETCH_ENABLED", "true").lower() == "true"
+
+# 并发采集最大线程数
+CONCURRENT_MAX_WORKERS = int(os.getenv("CONCURRENT_MAX_WORKERS", "7"))
+
+# 并发采集超时 (秒)
+CONCURRENT_FETCH_TIMEOUT = float(os.getenv("CONCURRENT_FETCH_TIMEOUT", "120.0"))
+
+# =====================================================================
+# 交叉校验配置
+# =====================================================================
+
+# 价格偏差容忍度 (0.5% = 0.005)
+CROSS_VALIDATION_PRICE_TOLERANCE = float(os.getenv("CROSS_VALIDATION_PRICE_TOLERANCE", "0.005"))
+
+# 成交量偏差容忍度 (5% = 0.05)
+CROSS_VALIDATION_VOLUME_TOLERANCE = float(os.getenv("CROSS_VALIDATION_VOLUME_TOLERANCE", "0.05"))
+
+# 涨跌幅偏差容忍度 (绝对值 1% = 0.01)
+CROSS_VALIDATION_PCT_CHG_TOLERANCE = float(os.getenv("CROSS_VALIDATION_PCT_CHG_TOLERANCE", "0.01"))
+
+# =====================================================================
+# 数据源独立开关 (true=启用, false=禁用)
+# =====================================================================
+
+DATASOURCE_EFINANCE_ENABLED = os.getenv("DATASOURCE_EFINANCE_ENABLED", "true").lower() == "true"
+DATASOURCE_AKSHARE_ENABLED = os.getenv("DATASOURCE_AKSHARE_ENABLED", "true").lower() == "true"
+DATASOURCE_TUSHARE_ENABLED = os.getenv("DATASOURCE_TUSHARE_ENABLED", "true").lower() == "true"
+DATASOURCE_BAOSTOCK_ENABLED = os.getenv("DATASOURCE_BAOSTOCK_ENABLED", "true").lower() == "true"
+DATASOURCE_YFINANCE_ENABLED = os.getenv("DATASOURCE_YFINANCE_ENABLED", "true").lower() == "true"
+DATASOURCE_LONGBRIDGE_ENABLED = os.getenv("DATASOURCE_LONGBRIDGE_ENABLED", "true").lower() == "true"
+DATASOURCE_EASTMONEY_ENABLED = os.getenv("DATASOURCE_EASTMONEY_ENABLED", "true").lower() == "true"
+
+# =====================================================================
+# 各数据源独立配置
+# =====================================================================
+
 # EfinanceFetcher: 东方财富 efinance 库, 免费无需 Token
 EFINANCE_SLEEP_MIN = float(os.getenv("EFINANCE_SLEEP_MIN", "1.5"))  # 秒
 EFINANCE_SLEEP_MAX = float(os.getenv("EFINANCE_SLEEP_MAX", "3.0"))  # 秒
@@ -39,7 +80,25 @@ TUSHARE_QUOTA_PER_MINUTE = int(os.getenv("TUSHARE_QUOTA_PER_MINUTE", "80"))
 BAOSTOCK_SLEEP_MIN = float(os.getenv("BAOSTOCK_SLEEP_MIN", "0.5"))  # 秒
 BAOSTOCK_SLEEP_MAX = float(os.getenv("BAOSTOCK_SLEEP_MAX", "1.5"))  # 秒
 
-# 熔断器配置 (参考 daily_stock_analysis CircuitBreaker)
+# YFinanceFetcher: Yahoo Finance, 免费
+YFINANCE_SLEEP_MIN = float(os.getenv("YFINANCE_SLEEP_MIN", "1.5"))  # 秒
+YFINANCE_SLEEP_MAX = float(os.getenv("YFINANCE_SLEEP_MAX", "3.0"))  # 秒
+
+# LongbridgeFetcher: 长桥, 需要 Token
+LONGBRIDGE_APP_KEY = os.getenv("LONGBRIDGE_APP_KEY", "")
+LONGBRIDGE_APP_SECRET = os.getenv("LONGBRIDGE_APP_SECRET", "")
+LONGBRIDGE_ACCESS_TOKEN = os.getenv("LONGBRIDGE_ACCESS_TOKEN", "")
+LONGBRIDGE_SLEEP_MIN = float(os.getenv("LONGBRIDGE_SLEEP_MIN", "1.0"))  # 秒
+LONGBRIDGE_SLEEP_MAX = float(os.getenv("LONGBRIDGE_SLEEP_MAX", "2.0"))  # 秒
+
+# EastmoneyFetcher: 东财直连 API
+EASTMONEY_SLEEP_MIN = float(os.getenv("EASTMONEY_SLEEP_MIN", "2.0"))  # 秒
+EASTMONEY_SLEEP_MAX = float(os.getenv("EASTMONEY_SLEEP_MAX", "5.0"))  # 秒
+
+# =====================================================================
+# 熔断器配置
+# =====================================================================
+
 CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3"))
 CIRCUIT_BREAKER_COOLDOWN_SECONDS = float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "300.0"))
 

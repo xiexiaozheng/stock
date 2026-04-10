@@ -29,8 +29,12 @@ class RealtimeSource(str, Enum):
     AKSHARE_EM = "akshare_em"       # 东方财富 (via akshare)
     AKSHARE_SINA = "akshare_sina"   # 新浪财经 (via akshare)
     AKSHARE_QQ = "akshare_qq"       # 腾讯财经 (via akshare)
+    AKSHARE_163 = "akshare_163"     # 网易/163 (via akshare)
     TUSHARE = "tushare"
     BAOSTOCK = "baostock"
+    YFINANCE = "yfinance"           # Yahoo Finance
+    LONGBRIDGE = "longbridge"       # 长桥
+    EASTMONEY_DIRECT = "eastmoney_direct"  # 东财直连 API
     SINA = "sina"                   # 直连新浪 API
     TENCENT = "tencent"             # 直连腾讯 API
     FALLBACK = "fallback"
