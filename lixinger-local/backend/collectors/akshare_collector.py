@@ -57,7 +57,7 @@ def _infer_exchange(code: str) -> str:
         return "SH"
     elif code.startswith(("00", "30")):
         return "SZ"
-    elif code.startswith(("43", "83", "87", "88")):
+    elif code.startswith(("43", "83", "87", "88", "92")):
         return "BJ"
     return "SZ"
 
