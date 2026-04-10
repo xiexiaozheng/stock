@@ -143,11 +143,11 @@ class TushareFetcher(BaseFetcher):
     def _ts_code(self, stock_code: str) -> str:
         """转换为 Tushare ts_code 格式: 600519 → 600519.SH"""
         code = normalize_stock_code(stock_code)
-        if code.startswith(("6", "9")):
+        if code.startswith(("6", "9")) and not code.startswith("92"):
             return f"{code}.SH"
         elif code.startswith(("0", "3")):
             return f"{code}.SZ"
-        elif code.startswith(("4", "8")):
+        elif code.startswith(("4", "8", "92")):
             return f"{code}.BJ"
         return f"{code}.SZ"
 
