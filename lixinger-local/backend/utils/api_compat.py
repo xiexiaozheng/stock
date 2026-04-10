@@ -23,16 +23,19 @@ class AkshareAPIError(Exception):
     """akshare 接口调用失败异常"""
 
 
-AKSHARE_API_MAP = {
-    api_key: {
-        "primary": next(iter(config.get("sources", {}).values()), {}).get("api_function"),
-        "fallbacks": [
-            source.get("api_function")
-            for source in list(config.get("sources", {}).values())[1:]
-        ],
+def _build_legacy_api_map_entry(api_key: str, config: Mapping[str, Any]) -> Dict[str, Any]:
+    source_values = list(config.get("sources", {}).values())
+    primary_source = source_values[0] if source_values else {}
+    return {
+        "primary": primary_source.get("api_function"),
+        "fallbacks": [source.get("api_function") for source in source_values[1:]],
         "description": config.get("description", api_key),
-        "params": next(iter(config.get("sources", {}).values()), {}).get("default_params", {}),
+        "params": primary_source.get("default_params", {}),
     }
+
+
+AKSHARE_API_MAP = {
+    api_key: _build_legacy_api_map_entry(api_key, config)
     for api_key, config in AKSHARE_API_CONFIGS.items()
 }
 

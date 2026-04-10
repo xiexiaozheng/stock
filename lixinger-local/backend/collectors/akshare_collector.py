@@ -52,6 +52,13 @@ def _safe_date(val) -> Optional[date]:
     return None
 
 
+def _to_dash_date_text(val: Any) -> str:
+    parsed = _safe_date(val)
+    if parsed is None:
+        raise ValueError(f"invalid date value: {val}")
+    return parsed.strftime("%Y-%m-%d")
+
+
 def _infer_exchange(code: str) -> str:
     """根据股票代码推断交易所"""
     if code.startswith(("60", "68")):
@@ -158,8 +165,8 @@ class AkshareCollector(BaseCollector):
         try:
             df, source = self.manager.get_daily_data(
                 stock_code,
-                start_date=f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}",
-                end_date=f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}",
+                start_date=_to_dash_date_text(start_date),
+                end_date=_to_dash_date_text(end_date),
                 days=0,
             )
             logger.info(
