@@ -494,7 +494,7 @@ class DataFetcherManager:
                     "TushareFetcher",
                     available=True,
                     priority=tf.priority,
-                    failure_reason=None if tushare_token else "未配置 TUSHARE_TOKEN (匿名模式, 数据有限)",
+                    # failure_reason 只在 available=False 时使用；token 缺失的提示通过 logger 输出
                 )
             )
             logger.info(f"[DataFetcherManager] 注册 TushareFetcher (priority={tf.priority})")
