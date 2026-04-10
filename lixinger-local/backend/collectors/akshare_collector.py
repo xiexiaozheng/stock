@@ -15,6 +15,7 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from collectors.base import BaseCollector
+from data_provider.base import DataFetcherManager, DataFetchError
 from models.stock import Stock, DailyQuote
 from models.financial import Financial
 from models.valuation import Valuation, Dividend
@@ -51,6 +52,13 @@ def _safe_date(val) -> Optional[date]:
     return None
 
 
+def _to_dash_date_text(val: Any) -> str:
+    parsed = _safe_date(val)
+    if parsed is None:
+        raise ValueError(f"invalid date value: {val}")
+    return parsed.strftime("%Y-%m-%d")
+
+
 def _infer_exchange(code: str) -> str:
     """根据股票代码推断交易所"""
     if code.startswith(("60", "68")):
@@ -65,15 +73,33 @@ def _infer_exchange(code: str) -> str:
 class AkshareCollector(BaseCollector):
     """akshare 数据采集器"""
 
+    def __init__(self, db: Session, manager: Optional[DataFetcherManager] = None):
+        super().__init__(db)
+        self._manager = manager
+        self._owns_manager = manager is None
+
+    @property
+    def manager(self) -> DataFetcherManager:
+        if self._manager is None:
+            self._manager = DataFetcherManager()
+        return self._manager
+
+    def close(self) -> None:
+        if self._owns_manager and self._manager is not None:
+            self._manager.close()
+            self._manager = None
+
     # ======================== 股票列表 ========================
 
     def collect_stock_list(self) -> int:
         """采集全市场 A 股列表，写入 stocks 表"""
         logger.info("开始采集 A 股股票列表...")
-        try:
-            df = call_akshare("stock_list")
-        except AkshareAPIError as e:
-            logger.error(f"股票列表采集失败: {e}")
+        df = self.manager.get_stock_list()
+        if df is None or df.empty:
+            logger.error(
+                "股票列表采集失败: %s",
+                self.manager.get_last_request_diagnostic("stock_list"),
+            )
             return 0
 
         rows = []
@@ -137,15 +163,19 @@ class AkshareCollector(BaseCollector):
 
         self._rate_limit(0.5, 1.0)
         try:
-            df = call_akshare(
-                "daily_quotes",
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq",
+            df, source = self.manager.get_daily_data(
+                stock_code,
+                start_date=_to_dash_date_text(start_date),
+                end_date=_to_dash_date_text(end_date),
+                days=0,
             )
-        except AkshareAPIError as e:
+            logger.info(
+                "%s 日线来自 %s, 诊断=%s",
+                stock_code,
+                source,
+                self.manager.get_last_request_diagnostic("daily_quotes"),
+            )
+        except DataFetchError as e:
             logger.error(f"{stock_code} 行情采集失败: {e}")
             return 0
 
@@ -194,19 +224,80 @@ class AkshareCollector(BaseCollector):
         logger.info(f"采集 {stock_code} 财务报表...")
 
         # 组装财务数据字典 {report_date: {...}}
-        data_map: Dict[str, Dict] = {}
+        data_map: Dict[date, Dict] = {}
+        frames = self.manager.get_financial_report_frames(stock_code)
 
-        self._collect_income(stock_code, data_map)
-        self._collect_balance(stock_code, data_map)
-        self._collect_cashflow(stock_code, data_map)
+        income_df = frames.get("income")
+        if income_df is not None and not income_df.empty:
+            for _, row in income_df.iterrows():
+                key, rt = self._parse_report_key(row)
+                if key is None:
+                    logger.warning("%s 利润表存在无法解析的报告期，已跳过", stock_code)
+                    continue
+                if key not in data_map:
+                    data_map[key] = {"report_type": rt}
+                entry = data_map[key]
+                entry["total_revenue"] = _safe_float(self._find_col(row, ["营业总收入", "total_revenue"]))
+                entry["operating_revenue"] = _safe_float(self._find_col(row, ["营业收入", "operating_revenue"]))
+                entry["operating_cost"] = _safe_float(self._find_col(row, ["营业总成本", "营业成本", "operating_cost"]))
+                rev = entry.get("operating_revenue") or entry.get("total_revenue")
+                cost = entry.get("operating_cost")
+                entry["gross_profit"] = (rev - cost) if (rev is not None and cost is not None) else None
+                entry["net_profit"] = _safe_float(self._find_col(row, ["净利润", "net_profit"]))
+                entry["net_profit_deducted"] = _safe_float(
+                    self._find_col(row, ["扣除非经常性损益后的净利润", "net_profit_deducted"])
+                )
+
+        balance_df = frames.get("balance")
+        if balance_df is not None and not balance_df.empty:
+            for _, row in balance_df.iterrows():
+                key, rt = self._parse_report_key(row)
+                if key is None:
+                    logger.warning("%s 资产负债表存在无法解析的报告期，已跳过", stock_code)
+                    continue
+                if key not in data_map:
+                    data_map[key] = {"report_type": rt}
+                entry = data_map[key]
+                entry["total_assets"] = _safe_float(self._find_col(row, ["资产总计", "total_assets"]))
+                entry["total_liabilities"] = _safe_float(self._find_col(row, ["负债合计", "total_liabilities"]))
+                entry["total_equity"] = _safe_float(self._find_col(row, ["所有者权益合计", "归属于母公司所有者权益合计", "total_equity"]))
+                entry["goodwill"] = _safe_float(self._find_col(row, ["商誉", "goodwill"]))
+
+        cashflow_df = frames.get("cashflow")
+        if cashflow_df is not None and not cashflow_df.empty:
+            for _, row in cashflow_df.iterrows():
+                key, rt = self._parse_report_key(row)
+                if key is None:
+                    logger.warning("%s 现金流量表存在无法解析的报告期，已跳过", stock_code)
+                    continue
+                if key not in data_map:
+                    data_map[key] = {"report_type": rt}
+                entry = data_map[key]
+                entry["operating_cash_flow"] = _safe_float(
+                    self._find_col(row, ["经营活动产生的现金流量净额", "operating_cash_flow"])
+                )
+                entry["investing_cash_flow"] = _safe_float(
+                    self._find_col(row, ["投资活动产生的现金流量净额", "investing_cash_flow"])
+                )
+                entry["financing_cash_flow"] = _safe_float(
+                    self._find_col(row, ["筹资活动产生的现金流量净额", "financing_cash_flow"])
+                )
+                ocf = entry.get("operating_cash_flow")
+                icf = entry.get("investing_cash_flow")
+                entry["free_cash_flow"] = ocf + icf if (ocf is not None and icf is not None) else None
 
         rows = []
         for report_date, fields in data_map.items():
             # 计算衍生指标
-            fields.update(self._calc_derived_metrics(fields))
-            fields["stock_code"] = stock_code
-            fields["report_date"] = report_date
-            rows.append(fields)
+            row = dict(fields)
+            row.update(self._calc_derived_metrics(row))
+            row["stock_code"] = stock_code
+            normalized_report_date = _safe_date(report_date)
+            if normalized_report_date is None:
+                logger.warning("%s 财务报表存在无效 report_date，已跳过: %s", stock_code, report_date)
+                continue
+            row["report_date"] = normalized_report_date
+            rows.append(row)
 
         if rows:
             self._upsert(Financial, rows, ["stock_code", "report_type", "report_date"])
@@ -313,8 +404,8 @@ class AkshareCollector(BaseCollector):
                     rt = "Q3"
                 else:
                     rt = "annual"
-                return str(d), rt
-        return str(datetime.today().date()), "annual"
+                return d, rt
+        return None, "annual"
 
     @staticmethod
     def _find_col(row, candidates: List[str]):

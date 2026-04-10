@@ -1,5 +1,5 @@
 """
-YFinanceFetcher — Yahoo Finance 数据源 Fetcher (Priority 4)
+YFinanceFetcher — Yahoo Finance 数据源 Fetcher
 
 数据来源: yfinance 库 (Yahoo Finance API)
 
@@ -48,7 +48,7 @@ class YFinanceFetcher(BaseFetcher):
     """
 
     name = "YFinanceFetcher"
-    priority = 4
+    framework_key = "yfinance"
 
     def __init__(self):
         super().__init__()

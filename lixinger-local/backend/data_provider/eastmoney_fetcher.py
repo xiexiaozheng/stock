@@ -1,5 +1,5 @@
 """
-EastmoneyFetcher — 东方财富直连 API Fetcher (Priority 6)
+EastmoneyFetcher — 东方财富直连 API Fetcher
 
 直接调用东方财富公开 HTTP API，不通过 akshare。
 
@@ -87,7 +87,7 @@ class EastmoneyFetcher(BaseFetcher):
     """
 
     name = "EastmoneyFetcher"
-    priority = 6
+    framework_key = "eastmoney"
 
     # 日K线历史 API
     KLINE_URL = (

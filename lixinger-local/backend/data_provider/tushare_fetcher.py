@@ -1,5 +1,5 @@
 """
-TushareFetcher — Tushare Pro 数据源 Fetcher (Priority 2, 有 Token 时 Priority 0)
+TushareFetcher — Tushare Pro 数据源 Fetcher
 
 参考 ZhuLinsen/daily_stock_analysis data_provider/tushare_fetcher.py
 
@@ -10,7 +10,7 @@ TushareFetcher — Tushare Pro 数据源 Fetcher (Priority 2, 有 Token 时 Prio
   - 需要 Token (注册后免费获取)
   - 免费额度限制: 80 次/分钟
   - 支持筹码分布 (cyq_chips, 高级权限)
-  - 有 Token 时自动提升到 Priority 0
+  - 配置 Token 后可使用更多接口能力
 
 防封禁策略:
   - 每分钟调用计数器 (80次/分钟免费配额)
@@ -56,7 +56,7 @@ class TushareFetcher(BaseFetcher):
     """
 
     name = "TushareFetcher"
-    priority = 2
+    framework_key = "tushare"
 
     # 免费配额: 80 次/分钟
     FREE_QUOTA_PER_MINUTE = 80

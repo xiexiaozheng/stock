@@ -10,17 +10,20 @@ BaseFetcher: 所有数据源实现的抽象基类
 DataFetcherManager: 策略管理器
   - 支持并发多源获取 (get_daily_data_concurrent)
   - 多数据源交叉校验 (CrossValidator)
-  - 自动按优先级 failover (兼容旧模式)
+  - 汇总可用/失败诊断
   - 多数据源字段补充
   - 线程安全
 
 改造说明:
-  - 新增 get_daily_data_concurrent(): 并发调用所有可用 Fetcher
-  - get_daily_data() 增加 concurrent 参数开关
+  - get_daily_data_concurrent(): 并发调用所有可用 Fetcher
+  - get_daily_data() 保留兼容参数但统一走并发入口
   - 注册新数据源: YFinance, Longbridge, Eastmoney
   - 使用 error_classifier 智能分类错误
 """
+import importlib
+import importlib.util
 import logging
+import os
 import random
 import threading
 import time
@@ -41,6 +44,11 @@ from data_provider.realtime_types import (
     merge_quote_fields,
     safe_float,
 )
+from data_provider.source_config import (
+    build_unavailable_reason,
+    get_framework_configs,
+)
+from utils.api_compat import call_akshare
 
 logger = logging.getLogger(__name__)
 
@@ -60,22 +68,25 @@ class FetcherStartupStatus:
     用于暴露"哪些框架初始化成功、哪些失败及原因"，
     使调用方无需猜测某个数据源是否参与了本次请求。
     """
+    framework_key: str
+    """框架唯一标识 (e.g. 'akshare')"""
+
     name: str
     """Fetcher 名称 (e.g. 'TushareFetcher')"""
 
     available: bool
     """是否成功注册"""
 
-    priority: Optional[int] = None
-    """注册成功时的优先级"""
-
     failure_reason: Optional[str] = None
     """注册失败时的原因描述"""
 
+    capabilities: List[str] = field(default_factory=list)
+    """框架支持能力"""
+
     def __str__(self) -> str:
         if self.available:
-            return f"  ✅ {self.name} (priority={self.priority})"
-        return f"  ❌ {self.name}: {self.failure_reason}"
+            return f"  ✅ {self.name} (enabled)"
+        return f"  ❌ {self.name} (unavailable: {self.failure_reason or 'unknown reason'})"
 # 异常层次
 # =====================================================================
 
@@ -147,7 +158,6 @@ class BaseFetcher(ABC):
 
     子类必须实现:
       - name: str          数据源名称
-      - priority: int      优先级 (0=最高)
       - _fetch_raw_data()  从数据源获取原始 DataFrame
       - _normalize_data()  将原始列名映射到 STANDARD_COLUMNS
 
@@ -160,7 +170,7 @@ class BaseFetcher(ABC):
     """
 
     name: str = "BaseFetcher"
-    priority: int = 99
+    framework_key: str = "base"
 
     def __init__(self):
         self._last_request_time: float = 0.0
@@ -352,11 +362,7 @@ class DataFetcherManager:
     """
     多数据源管理器 (并发多源 + 交叉校验版)
 
-    支持两种模式:
-    1. 并发模式 (concurrent=True, 默认): 并发调用所有可用 Fetcher，
-       收集结果后交叉校验，返回最佳数据
-    2. 顺序 failover 模式 (concurrent=False): 按优先级顺序尝试，
-       第一个成功的直接返回
+    统一并发调用所有可用 Fetcher，收集结果后交叉校验并输出诊断。
 
     管理所有 Fetcher 实例:
     - EfinanceFetcher (东方财富 efinance)
@@ -369,8 +375,7 @@ class DataFetcherManager:
 
     用法:
         manager = DataFetcherManager()
-        df, source = manager.get_daily_data('600519')  # 默认并发模式
-        df, source = manager.get_daily_data('600519', concurrent=False)  # 旧模式
+        df, source = manager.get_daily_data('600519')
         quote = manager.get_realtime_quote('600519')
         manager.close()
     """
@@ -382,6 +387,7 @@ class DataFetcherManager:
         self._stock_name_cache_lock = threading.Lock()
         # 启动诊断: 记录每个 Fetcher 的初始化状态
         self._startup_statuses: List[FetcherStartupStatus] = []
+        self._last_request_diagnostics: Dict[str, Dict[str, Any]] = {}
 
         if fetchers:
             for f in fetchers:
@@ -409,182 +415,154 @@ class DataFetcherManager:
         """
         返回所有 Fetcher 的启动状态列表（包括失败的）。
 
-        调用方可用此方法了解：
-        - 哪些框架成功注册
-        - 哪些框架未能启动以及原因
-        - 每个框架的优先级
+        调用方可用此方法了解哪些框架可用、哪些不可用以及失败原因。
 
         示例::
 
             manager = DataFetcherManager()
             for status in manager.get_startup_status():
                 print(status)
-            # ✅ AkshareFetcher (priority=1)
-            # ❌ TushareFetcher: 缺少 TUSHARE_TOKEN 环境变量
+            # ✅ AkshareFetcher (enabled)
+            # ❌ LongbridgeFetcher (unavailable: missing env ...)
         """
         return list(self._startup_statuses)
 
+    def get_startup_diagnostics(self) -> Dict[str, Any]:
+        return {
+            "available_fetchers": [
+                {
+                    "framework": status.framework_key,
+                    "name": status.name,
+                    "capabilities": status.capabilities,
+                }
+                for status in self._startup_statuses
+                if status.available
+            ],
+            "unavailable_fetchers": [
+                {
+                    "framework": status.framework_key,
+                    "name": status.name,
+                    "reason": status.failure_reason,
+                }
+                for status in self._startup_statuses
+                if not status.available
+            ],
+        }
+
     def _auto_register_fetchers(self) -> None:
-        """
-        自动注册所有可用的 Fetcher（按优先级）。
-
-        捕获所有初始化异常（不仅是 ImportError），并记录失败原因到
-        _startup_statuses，确保调用方能看到每个框架是否可用及原因。
-
-        注册顺序:
-          0. EfinanceFetcher
-          1. AkshareFetcher
-          2. TushareFetcher
-          3. BaostockFetcher
-          4. YFinanceFetcher
-          5. LongbridgeFetcher
-          6. EastmoneyFetcher
-        """
-        import os
-        tushare_token = os.getenv("TUSHARE_TOKEN", "")
-
-        # Priority 0: EfinanceFetcher
-        try:
-            from data_provider.efinance_fetcher import EfinanceFetcher
-            ef = EfinanceFetcher()
-            if tushare_token:
-                ef.priority = 1
-            self.register_fetcher(ef)
-            self._startup_statuses.append(
-                FetcherStartupStatus("EfinanceFetcher", available=True, priority=ef.priority)
-            )
-            logger.info(f"[DataFetcherManager] 注册 EfinanceFetcher (priority={ef.priority})")
-        except Exception as e:
-            reason = f"efinance 未安装或导入失败: {e}" if isinstance(e, ImportError) else str(e)
-            self._startup_statuses.append(
-                FetcherStartupStatus("EfinanceFetcher", available=False, failure_reason=reason)
-            )
-            logger.warning(f"[DataFetcherManager] EfinanceFetcher 不可用: {reason}")
-
-        # Priority 1: AkshareFetcher
-        try:
-            from data_provider.akshare_fetcher import AkshareFetcher
-            af = AkshareFetcher()
-            self.register_fetcher(af)
-            self._startup_statuses.append(
-                FetcherStartupStatus("AkshareFetcher", available=True, priority=af.priority)
-            )
-            logger.info(f"[DataFetcherManager] 注册 AkshareFetcher (priority={af.priority})")
-        except Exception as e:
-            reason = f"akshare 未安装或导入失败: {e}" if isinstance(e, ImportError) else str(e)
-            self._startup_statuses.append(
-                FetcherStartupStatus("AkshareFetcher", available=False, failure_reason=reason)
-            )
-            logger.warning(f"[DataFetcherManager] AkshareFetcher 不可用: {reason}")
-
-        # Priority 2: TushareFetcher
-        try:
-            from data_provider.tushare_fetcher import TushareFetcher
-            tf = TushareFetcher(token=tushare_token)
-            if tushare_token:
-                tf.priority = 0
-            else:
-                logger.info(
-                    "[DataFetcherManager] TushareFetcher 已注册但未配置 TUSHARE_TOKEN, "
-                    "实际请求时将以匿名模式尝试"
+        framework_configs = get_framework_configs()
+        for framework_key, framework_config in framework_configs.items():
+            name = framework_config["name"]
+            capabilities = list(framework_config.get("capabilities", []))
+            if not framework_config.get("enabled_by_default", True):
+                reason = "disabled by configuration"
+                self._startup_statuses.append(
+                    FetcherStartupStatus(
+                        framework_key=framework_key,
+                        name=name,
+                        available=False,
+                        failure_reason=reason,
+                        capabilities=capabilities,
+                    )
                 )
-            self.register_fetcher(tf)
-            self._startup_statuses.append(
-                FetcherStartupStatus(
-                    "TushareFetcher",
-                    available=True,
-                    priority=tf.priority,
-                    # failure_reason 只在 available=False 时使用；token 缺失的提示通过 logger 输出
+                continue
+
+            dependency = framework_config.get("required_dependency")
+            if dependency and importlib.util.find_spec(dependency) is None:
+                reason = f"missing dependency: {dependency}"
+                self._startup_statuses.append(
+                    FetcherStartupStatus(
+                        framework_key=framework_key,
+                        name=name,
+                        available=False,
+                        failure_reason=reason,
+                        capabilities=capabilities,
+                    )
                 )
-            )
-            logger.info(f"[DataFetcherManager] 注册 TushareFetcher (priority={tf.priority})")
-        except Exception as e:
-            reason = (
-                f"tushare 未安装: {e}" if isinstance(e, ImportError)
-                else f"TushareFetcher 初始化失败: {e}"
-            )
-            self._startup_statuses.append(
-                FetcherStartupStatus("TushareFetcher", available=False, failure_reason=reason)
-            )
-            logger.warning(f"[DataFetcherManager] TushareFetcher 不可用: {reason}")
+                logger.warning(
+                    "[DataFetcherManager] %s",
+                    build_unavailable_reason(framework_config, reason),
+                )
+                continue
 
-        # Priority 3: BaostockFetcher
-        try:
-            from data_provider.baostock_fetcher import BaostockFetcher
-            bf = BaostockFetcher()
-            self.register_fetcher(bf)
-            self._startup_statuses.append(
-                FetcherStartupStatus("BaostockFetcher", available=True, priority=bf.priority)
-            )
-            logger.info(f"[DataFetcherManager] 注册 BaostockFetcher (priority={bf.priority})")
-        except Exception as e:
-            reason = f"baostock 未安装: {e}" if isinstance(e, ImportError) else str(e)
-            self._startup_statuses.append(
-                FetcherStartupStatus("BaostockFetcher", available=False, failure_reason=reason)
-            )
-            logger.warning(f"[DataFetcherManager] BaostockFetcher 不可用: {reason}")
+            missing_env = [
+                key for key in framework_config.get("required_env", [])
+                if not os.getenv(key)
+            ]
+            if missing_env:
+                reason = f"missing env: {', '.join(missing_env)}"
+                self._startup_statuses.append(
+                    FetcherStartupStatus(
+                        framework_key=framework_key,
+                        name=name,
+                        available=False,
+                        failure_reason=reason,
+                        capabilities=capabilities,
+                    )
+                )
+                logger.warning(
+                    "[DataFetcherManager] %s",
+                    build_unavailable_reason(framework_config, reason),
+                )
+                continue
 
-        # Priority 4: YFinanceFetcher
-        try:
-            from data_provider.yfinance_fetcher import YFinanceFetcher
-            yf = YFinanceFetcher()
-            self.register_fetcher(yf)
-            self._startup_statuses.append(
-                FetcherStartupStatus("YFinanceFetcher", available=True, priority=yf.priority)
-            )
-            logger.info(f"[DataFetcherManager] 注册 YFinanceFetcher (priority={yf.priority})")
-        except Exception as e:
-            reason = f"yfinance 未安装: {e}" if isinstance(e, ImportError) else str(e)
-            self._startup_statuses.append(
-                FetcherStartupStatus("YFinanceFetcher", available=False, failure_reason=reason)
-            )
-            logger.debug(f"[DataFetcherManager] YFinanceFetcher 不可用: {reason}")
-
-        # Priority 5: LongbridgeFetcher
-        try:
-            from data_provider.longbridge_fetcher import LongbridgeFetcher
-            lb = LongbridgeFetcher()
-            self.register_fetcher(lb)
-            self._startup_statuses.append(
-                FetcherStartupStatus("LongbridgeFetcher", available=True, priority=lb.priority)
-            )
-            logger.info(f"[DataFetcherManager] 注册 LongbridgeFetcher (priority={lb.priority})")
-        except Exception as e:
-            reason = (
-                f"longport 未安装: {e}" if isinstance(e, ImportError)
-                else f"LongbridgeFetcher 初始化失败 (可能缺少 LONGBRIDGE_APP_KEY 等环境变量): {e}"
-            )
-            self._startup_statuses.append(
-                FetcherStartupStatus("LongbridgeFetcher", available=False, failure_reason=reason)
-            )
-            logger.debug(f"[DataFetcherManager] LongbridgeFetcher 不可用: {reason}")
-
-        # Priority 6: EastmoneyFetcher
-        try:
-            from data_provider.eastmoney_fetcher import EastmoneyFetcher
-            em = EastmoneyFetcher()
-            self.register_fetcher(em)
-            self._startup_statuses.append(
-                FetcherStartupStatus("EastmoneyFetcher", available=True, priority=em.priority)
-            )
-            logger.info(f"[DataFetcherManager] 注册 EastmoneyFetcher (priority={em.priority})")
-        except Exception as e:
-            reason = str(e)
-            self._startup_statuses.append(
-                FetcherStartupStatus("EastmoneyFetcher", available=False, failure_reason=reason)
-            )
-            logger.debug(f"[DataFetcherManager] EastmoneyFetcher 不可用: {reason}")
+            try:
+                module_path, class_name = framework_config["fetcher_class"].rsplit(".", 1)
+                fetcher_class = getattr(importlib.import_module(module_path), class_name)
+                ctor_kwargs = {
+                    arg_name: os.getenv(env_name, "")
+                    for arg_name, env_name in framework_config.get("constructor_env", {}).items()
+                }
+                fetcher = fetcher_class(**ctor_kwargs)
+                fetcher.framework_key = framework_key
+                self.register_fetcher(fetcher)
+                self._startup_statuses.append(
+                    FetcherStartupStatus(
+                        framework_key=framework_key,
+                        name=name,
+                        available=True,
+                        capabilities=capabilities,
+                    )
+                )
+                logger.info("[DataFetcherManager] 注册 %s (enabled)", name)
+            except Exception as exc:
+                reason = str(exc)
+                self._startup_statuses.append(
+                    FetcherStartupStatus(
+                        framework_key=framework_key,
+                        name=name,
+                        available=False,
+                        failure_reason=reason,
+                        capabilities=capabilities,
+                    )
+                )
+                logger.warning(
+                    "[DataFetcherManager] %s",
+                    build_unavailable_reason(framework_config, reason),
+                )
 
     def register_fetcher(self, fetcher: BaseFetcher) -> None:
-        """注册一个 Fetcher 并按优先级排序"""
+        """注册一个 Fetcher，保持配置顺序。"""
         with self._fetchers_lock:
             self._fetchers.append(fetcher)
-            self._fetchers.sort(key=lambda f: f.priority)
 
-    def get_fetchers(self) -> List[BaseFetcher]:
-        """返回按优先级排序的 Fetcher 列表"""
+    def get_fetchers(self, capability: Optional[str] = None) -> List[BaseFetcher]:
+        """返回 Fetcher 列表，可按 capability 过滤。"""
         with self._fetchers_lock:
-            return list(self._fetchers)
+            fetchers = list(self._fetchers)
+        if capability is None:
+            return fetchers
+        capabilities_by_framework = {
+            status.framework_key: set(status.capabilities)
+            for status in self._startup_statuses
+            if status.available
+        }
+        return [
+            fetcher for fetcher in fetchers
+            if capability in capabilities_by_framework.get(
+                getattr(fetcher, "framework_key", ""), set()
+            )
+        ]
 
     # ---- 日K线数据（并发多源 + 交叉校验）----
 
@@ -599,17 +577,14 @@ class DataFetcherManager:
         """
         获取日K线数据。
 
-        :param concurrent: True=并发多源+交叉校验, False=按优先级 failover
+        :param concurrent: 兼容旧参数；当前始终并发执行
         :return: (DataFrame, source_name)
         :raises DataFetchError: 所有数据源都失败时
         """
-        if concurrent:
-            return self.get_daily_data_concurrent(
-                stock_code, start_date, end_date, days
-            )
-        return self._get_daily_data_failover(
-            stock_code, start_date, end_date, days
-        )
+        return self.get_daily_data_concurrent(stock_code, start_date, end_date, days)
+
+    def get_last_request_diagnostic(self, capability: str = "daily_quotes") -> Dict[str, Any]:
+        return dict(self._last_request_diagnostics.get(capability, {}))
 
     def get_daily_data_concurrent(
         self,
@@ -640,15 +615,24 @@ class DataFetcherManager:
             CONCURRENT_MAX_WORKERS = 7
 
         circuit_breaker = get_daily_circuit_breaker()
-        fetchers = self.get_fetchers()
+        fetchers = self.get_fetchers(capability="daily_quotes")
         errors: List[str] = []
         source_results: Dict[str, pd.DataFrame] = {}
+        diagnostic = {
+            "attempted_fetchers": [fetcher.name for fetcher in fetchers],
+            "successful_fetchers": [],
+            "failed_fetchers": [],
+            "failure_reasons": {},
+            "best_source": None,
+            "merged_sources": [],
+            "consistency_score": 0.0,
+        }
 
-        def _fetch_from_source(fetcher: BaseFetcher) -> Tuple[str, pd.DataFrame]:
+        def _fetch_from_source(fetcher: BaseFetcher) -> Tuple[str, pd.DataFrame, Optional[str]]:
             """从单个数据源获取数据"""
             source_key = f"daily_{fetcher.name}"
             if not circuit_breaker.is_available(source_key):
-                return fetcher.name, pd.DataFrame()
+                return fetcher.name, pd.DataFrame(), "熔断中"
             try:
                 df = fetcher.get_daily_data(
                     stock_code,
@@ -658,9 +642,9 @@ class DataFetcherManager:
                 )
                 if df is not None and not df.empty:
                     circuit_breaker.record_success(source_key)
-                    return fetcher.name, df
+                    return fetcher.name, df, None
                 circuit_breaker.record_inconclusive(source_key)
-                return fetcher.name, pd.DataFrame()
+                return fetcher.name, pd.DataFrame(), "返回空数据"
             except Exception as e:
                 category = classify_error(e)
                 if category == ErrorCategory.API_SYNTAX:
@@ -672,7 +656,7 @@ class DataFetcherManager:
                         f"[DataFetcherManager] {fetcher.name} 反爬虫错误: {e}"
                     )
                 circuit_breaker.record_failure(source_key, str(e))
-                return fetcher.name, pd.DataFrame()
+                return fetcher.name, pd.DataFrame(), f"{category.value}: {e}"
 
         # 并发调用所有 Fetcher
         try:
@@ -687,23 +671,30 @@ class DataFetcherManager:
                 }
                 for future in as_completed(futures, timeout=CONCURRENT_FETCH_TIMEOUT):
                     try:
-                        name, df = future.result(timeout=CONCURRENT_FETCH_TIMEOUT / 2)
+                        name, df, error_reason = future.result(timeout=CONCURRENT_FETCH_TIMEOUT / 2)
                         if df is not None and not df.empty:
                             source_results[name] = df
+                            diagnostic["successful_fetchers"].append(name)
                         elif name:
-                            errors.append(f"{name}: 返回空数据")
+                            errors.append(f"{name}: {error_reason or '返回空数据'}")
+                            diagnostic["failed_fetchers"].append(name)
+                            diagnostic["failure_reasons"][name] = error_reason or "返回空数据"
                     except Exception as e:
                         fetcher_name = futures[future]
                         errors.append(f"{fetcher_name}: {e}")
+                        diagnostic["failed_fetchers"].append(fetcher_name)
+                        diagnostic["failure_reasons"][fetcher_name] = str(e)
         except Exception as e:
-            logger.warning(
-                f"[DataFetcherManager] 并发执行异常，降级为 failover: {e}"
+            diagnostic["failed_fetchers"].extend(
+                name for name in diagnostic["attempted_fetchers"]
+                if name not in diagnostic["failed_fetchers"]
+                and name not in diagnostic["successful_fetchers"]
             )
-            return self._get_daily_data_failover(
-                stock_code, start_date, end_date, days
-            )
+            self._last_request_diagnostics["daily_quotes"] = diagnostic
+            raise DataFetchError(f"并发执行异常: {e}") from e
 
         if not source_results:
+            self._last_request_diagnostics["daily_quotes"] = diagnostic
             raise DataFetchError(
                 f"所有数据源获取 {stock_code} 日K线均失败 (并发模式):\n"
                 + "\n".join(f"  - {e}" for e in errors)
@@ -713,6 +704,10 @@ class DataFetcherManager:
         if len(source_results) == 1:
             source_name = next(iter(source_results))
             df = source_results[source_name]
+            diagnostic["best_source"] = source_name
+            diagnostic["merged_sources"] = [source_name]
+            diagnostic["consistency_score"] = 1.0
+            self._last_request_diagnostics["daily_quotes"] = diagnostic
             logger.info(
                 f"[DataFetcherManager] {stock_code} 日K线仅 {source_name} 返回 {len(df)} 行"
             )
@@ -728,6 +723,11 @@ class DataFetcherManager:
             f"best={report.best_source}|"
             f"score={report.consistency_score:.4f})"
         )
+        diagnostic["best_source"] = report.best_source
+        diagnostic["merged_sources"] = list(source_results.keys())
+        diagnostic["consistency_score"] = report.consistency_score
+        diagnostic["anomalies"] = report.anomalies
+        self._last_request_diagnostics["daily_quotes"] = diagnostic
         logger.info(
             f"[DataFetcherManager] {stock_code} 并发校验完成: {sources_info}"
         )
@@ -748,51 +748,8 @@ class DataFetcherManager:
         end_date: Optional[str] = None,
         days: int = 30,
     ) -> Tuple[pd.DataFrame, str]:
-        """
-        原有的按优先级顺序 failover 模式。
-
-        :return: (DataFrame, fetcher_name)
-        :raises DataFetchError: 所有数据源都失败时
-        """
-        circuit_breaker = get_daily_circuit_breaker()
-        errors: List[str] = []
-
-        for fetcher in self.get_fetchers():
-            source_key = f"daily_{fetcher.name}"
-
-            if not circuit_breaker.is_available(source_key):
-                errors.append(f"{fetcher.name}: 熔断中")
-                continue
-
-            try:
-                df = fetcher.get_daily_data(
-                    stock_code,
-                    start_date=start_date,
-                    end_date=end_date,
-                    days=days,
-                )
-                if df is not None and not df.empty:
-                    circuit_breaker.record_success(source_key)
-                    logger.info(
-                        f"[DataFetcherManager] {stock_code} 日K线 "
-                        f"来自 {fetcher.name}, {len(df)} 行"
-                    )
-                    return df, fetcher.name
-                else:
-                    errors.append(f"{fetcher.name}: 返回空数据")
-                    circuit_breaker.record_inconclusive(source_key)
-            except Exception as e:
-                circuit_breaker.record_failure(source_key, str(e))
-                errors.append(f"{fetcher.name}: {e}")
-                logger.warning(
-                    f"[DataFetcherManager] {stock_code} "
-                    f"{fetcher.name} 日K线失败: {e}"
-                )
-
-        raise DataFetchError(
-            f"所有数据源获取 {stock_code} 日K线均失败:\n"
-            + "\n".join(f"  - {e}" for e in errors)
-        )
+        """兼容旧接口，内部转到并发入口。"""
+        return self.get_daily_data_concurrent(stock_code, start_date, end_date, days)
 
     # ---- 实时行情（多源补充）----
 
@@ -804,7 +761,7 @@ class DataFetcherManager:
         获取实时行情，尝试所有 Fetcher 并合并缺失字段。
 
         策略:
-        1. 从最高优先级开始，取到有效报价
+        1. 依次尝试已注册且可用的数据源
         2. 如果报价缺少量能/估值字段，从后续数据源补充
         3. 熔断器保护每个数据源
         """
@@ -912,17 +869,122 @@ class DataFetcherManager:
     # ---- 股票列表 ----
 
     def get_stock_list(self) -> Optional[pd.DataFrame]:
-        """获取A股股票列表（从第一个成功的 Fetcher 返回）"""
-        for fetcher in self.get_fetchers():
+        """并发获取股票列表并聚合。"""
+        fetchers = self.get_fetchers(capability="stock_list")
+        diagnostic = {
+            "attempted_fetchers": [fetcher.name for fetcher in fetchers],
+            "successful_fetchers": [],
+            "failed_fetchers": [],
+            "failure_reasons": {},
+            "best_source": None,
+            "merged_sources": [],
+        }
+
+        if not fetchers:
+            self._last_request_diagnostics["stock_list"] = diagnostic
+            return None
+
+        results: Dict[str, pd.DataFrame] = {}
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(fetchers)),
+            thread_name_prefix="stock_list",
+        ) as executor:
+            futures = {executor.submit(fetcher.get_stock_list): fetcher.name for fetcher in fetchers}
+            for future in as_completed(futures, timeout=60):
+                name = futures[future]
+                try:
+                    df = future.result(timeout=20)
+                    if df is not None and not df.empty:
+                        results[name] = df
+                        diagnostic["successful_fetchers"].append(name)
+                    else:
+                        diagnostic["failed_fetchers"].append(name)
+                        diagnostic["failure_reasons"][name] = "返回空数据"
+                except Exception as exc:
+                    diagnostic["failed_fetchers"].append(name)
+                    diagnostic["failure_reasons"][name] = str(exc)
+                    logger.warning("[DataFetcherManager] %s 股票列表失败: %s", name, exc)
+
+        if not results:
+            self._last_request_diagnostics["stock_list"] = diagnostic
+            return None
+
+        normalized_frames = []
+        for source_name, df in results.items():
+            current = df.copy()
+            rename_map = {
+                "股票代码": "code",
+                "code": "code",
+                "symbol": "code",
+                "股票名称": "name",
+                "股票简称": "name",
+                "name": "name",
+                "industry": "industry",
+                "所属行业": "industry",
+            }
+            current = current.rename(columns={k: v for k, v in rename_map.items() if k in current.columns})
+            if "code" not in current.columns or "name" not in current.columns:
+                continue
+            current["code"] = current["code"].astype(str).str.strip().str.zfill(6)
+            current["name"] = current["name"].astype(str).str.strip()
+            current["source"] = source_name
+            keep_columns = [col for col in ("code", "name", "industry", "source") if col in current.columns]
+            normalized_frames.append(current[keep_columns])
+
+        if not normalized_frames:
+            self._last_request_diagnostics["stock_list"] = diagnostic
+            return next(iter(results.values()))
+
+        merged = pd.concat(normalized_frames, ignore_index=True)
+        merged = merged[merged["code"].astype(bool) & merged["name"].astype(bool)]
+        merged = merged.drop_duplicates(subset=["code"], keep="first")
+        diagnostic["best_source"] = diagnostic["successful_fetchers"][0]
+        diagnostic["merged_sources"] = list(results.keys())
+        self._last_request_diagnostics["stock_list"] = diagnostic
+        return merged.reset_index(drop=True)
+
+    def get_financial_report_frames(self, stock_code: str) -> Dict[str, Any]:
+        """统一财务报表入口，供旧 collector 和 core collector 复用。"""
+        capability = "financial_reports"
+        startup = self.get_startup_diagnostics()
+        attempted = []
+        successful = []
+        failed = []
+        failure_reasons: Dict[str, str] = {}
+        unsupported = {
+            item["name"]: "capability not supported"
+            for item in startup.get("available_fetchers", [])
+            if capability not in item.get("capabilities", [])
+        }
+        frames: Dict[str, pd.DataFrame] = {}
+
+        for api_key, alias in (
+            ("financial_income", "income"),
+            ("financial_balance", "balance"),
+            ("financial_cashflow", "cashflow"),
+        ):
+            fetcher_name = "AkshareFetcher"
+            attempted.append(fetcher_name)
             try:
-                df = fetcher.get_stock_list()
-                if df is not None and not df.empty:
-                    return df
-            except Exception as e:
-                logger.warning(
-                    f"[DataFetcherManager] {fetcher.name} 股票列表失败: {e}"
-                )
-        return None
+                frames[alias] = call_akshare(api_key, stock=stock_code)
+                successful.append(fetcher_name)
+            except Exception as exc:
+                failed.append(fetcher_name)
+                failure_reasons[f"{fetcher_name}:{alias}"] = str(exc)
+                logger.warning("[DataFetcherManager] %s %s 失败: %s", fetcher_name, alias, exc)
+
+        diagnostic = {
+            "attempted_fetchers": sorted(set(attempted)),
+            "successful_fetchers": sorted(set(successful)),
+            "failed_fetchers": sorted(set(failed + list(unsupported.keys()))),
+            "failure_reasons": {**unsupported, **failure_reasons},
+            "best_source": "AkshareFetcher" if frames else None,
+            "merged_sources": ["AkshareFetcher"] if frames else [],
+            "consistency_score": 1.0 if frames else 0.0,
+        }
+        self._last_request_diagnostics[capability] = diagnostic
+        frames["diagnostic"] = diagnostic
+        return frames
 
     # ---- 资源释放 ----
 

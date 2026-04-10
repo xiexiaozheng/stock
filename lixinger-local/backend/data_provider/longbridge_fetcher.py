@@ -1,5 +1,5 @@
 """
-LongbridgeFetcher — Longbridge (长桥) 数据源 Fetcher (Priority 5)
+LongbridgeFetcher — Longbridge (长桥) 数据源 Fetcher
 
 数据来源: Longbridge OpenAPI SDK
 
@@ -52,7 +52,7 @@ class LongbridgeFetcher(BaseFetcher):
     """
 
     name = "LongbridgeFetcher"
-    priority = 5
+    framework_key = "longbridge"
 
     def __init__(self):
         super().__init__()
