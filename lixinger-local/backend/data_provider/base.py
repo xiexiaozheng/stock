@@ -86,10 +86,7 @@ class FetcherStartupStatus:
     def __str__(self) -> str:
         if self.available:
             return f"  ✅ {self.name} (enabled)"
-        reason = self.failure_reason or "unknown reason"
-        if "unavailable:" in reason:
-            return f"  ❌ {self.name} ({reason})"
-        return f"  ❌ {self.name} (unavailable: {reason})"
+        return f"  ❌ {self.name} (unavailable: {self.failure_reason or 'unknown reason'})"
 # 异常层次
 # =====================================================================
 
@@ -472,9 +469,7 @@ class DataFetcherManager:
 
             dependency = framework_config.get("required_dependency")
             if dependency and importlib.util.find_spec(dependency) is None:
-                reason = build_unavailable_reason(
-                    framework_config, f"missing dependency: {dependency}"
-                )
+                reason = f"missing dependency: {dependency}"
                 self._startup_statuses.append(
                     FetcherStartupStatus(
                         framework_key=framework_key,
@@ -483,6 +478,10 @@ class DataFetcherManager:
                         failure_reason=reason,
                         capabilities=capabilities,
                     )
+                )
+                logger.warning(
+                    "[DataFetcherManager] %s",
+                    build_unavailable_reason(framework_config, reason),
                 )
                 continue
 
@@ -491,9 +490,7 @@ class DataFetcherManager:
                 if not os.getenv(key)
             ]
             if missing_env:
-                reason = build_unavailable_reason(
-                    framework_config, f"missing env: {', '.join(missing_env)}"
-                )
+                reason = f"missing env: {', '.join(missing_env)}"
                 self._startup_statuses.append(
                     FetcherStartupStatus(
                         framework_key=framework_key,
@@ -502,6 +499,10 @@ class DataFetcherManager:
                         failure_reason=reason,
                         capabilities=capabilities,
                     )
+                )
+                logger.warning(
+                    "[DataFetcherManager] %s",
+                    build_unavailable_reason(framework_config, reason),
                 )
                 continue
 
@@ -525,7 +526,7 @@ class DataFetcherManager:
                 )
                 logger.info("[DataFetcherManager] 注册 %s (enabled)", name)
             except Exception as exc:
-                reason = build_unavailable_reason(framework_config, str(exc))
+                reason = str(exc)
                 self._startup_statuses.append(
                     FetcherStartupStatus(
                         framework_key=framework_key,
@@ -535,7 +536,10 @@ class DataFetcherManager:
                         capabilities=capabilities,
                     )
                 )
-                logger.warning("[DataFetcherManager] %s 不可用: %s", name, reason)
+                logger.warning(
+                    "[DataFetcherManager] %s",
+                    build_unavailable_reason(framework_config, reason),
+                )
 
     def register_fetcher(self, fetcher: BaseFetcher) -> None:
         """注册一个 Fetcher，保持配置顺序。"""

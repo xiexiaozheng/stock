@@ -224,6 +224,9 @@ class AkshareCollector(BaseCollector):
         if income_df is not None and not income_df.empty:
             for _, row in income_df.iterrows():
                 key, rt = self._parse_report_key(row)
+                if key is None:
+                    logger.warning("%s 利润表存在无法解析的报告期，已跳过", stock_code)
+                    continue
                 if key not in data_map:
                     data_map[key] = {"report_type": rt}
                 entry = data_map[key]
@@ -242,6 +245,9 @@ class AkshareCollector(BaseCollector):
         if balance_df is not None and not balance_df.empty:
             for _, row in balance_df.iterrows():
                 key, rt = self._parse_report_key(row)
+                if key is None:
+                    logger.warning("%s 资产负债表存在无法解析的报告期，已跳过", stock_code)
+                    continue
                 if key not in data_map:
                     data_map[key] = {"report_type": rt}
                 entry = data_map[key]
@@ -254,6 +260,9 @@ class AkshareCollector(BaseCollector):
         if cashflow_df is not None and not cashflow_df.empty:
             for _, row in cashflow_df.iterrows():
                 key, rt = self._parse_report_key(row)
+                if key is None:
+                    logger.warning("%s 现金流量表存在无法解析的报告期，已跳过", stock_code)
+                    continue
                 if key not in data_map:
                     data_map[key] = {"report_type": rt}
                 entry = data_map[key]
@@ -276,7 +285,11 @@ class AkshareCollector(BaseCollector):
             row = dict(fields)
             row.update(self._calc_derived_metrics(row))
             row["stock_code"] = stock_code
-            row["report_date"] = _safe_date(report_date) or datetime.today().date()
+            normalized_report_date = _safe_date(report_date)
+            if normalized_report_date is None:
+                logger.warning("%s 财务报表存在无效 report_date，已跳过: %s", stock_code, report_date)
+                continue
+            row["report_date"] = normalized_report_date
             rows.append(row)
 
         if rows:
@@ -385,7 +398,7 @@ class AkshareCollector(BaseCollector):
                 else:
                     rt = "annual"
                 return d, rt
-        return datetime.today().date(), "annual"
+        return None, "annual"
 
     @staticmethod
     def _find_col(row, candidates: List[str]):

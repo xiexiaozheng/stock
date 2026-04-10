@@ -113,6 +113,11 @@ def _get_error_classifier():
 
 
 def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapping[str, Any]) -> Any:
+    source_config = dict(source_config)
+    source_config.setdefault(
+        "source_name",
+        source_config.get("api_function", "unknown").split(".")[-1],
+    )
     if not source_config.get("enabled", True):
         raise AttributeError(source_config.get("disabled_reason", "source disabled"))
 
