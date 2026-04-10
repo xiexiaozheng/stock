@@ -175,15 +175,16 @@ lixinger-local/
 
 ## akshare 接口兼容性说明
 
-akshare 接口更新较频繁。本项目通过 `backend/utils/api_compat.py` 提供统一的接口映射层：
+akshare 接口更新较频繁。本项目通过 `backend/data_provider/source_config.py` 集中管理所有 AKShare 接口配置（签名、参数白名单、字段映射、fallback 顺序等），`backend/utils/api_compat.py` 作为统一调用入口。
 
 1. **首次运行前**，建议执行健康检查：
    ```bash
    python scripts/check_akshare.py
    ```
 
-2. **如果某接口报错**，在 `backend/utils/api_compat.py` 的 `AKSHARE_API_MAP` 中
-   修改对应的 `primary` 或添加 `fallbacks`，无需改动业务代码。
+2. **如果某接口报错**，在 `backend/data_provider/source_config.py` 的 `AKSHARE_API_CONFIGS` 中
+   修改对应 `sources` 下的 `api_function`、`signature`、`supported_params` 等字段，
+   无需改动业务代码。`api_compat.py` 会自动读取最新配置。
 
 3. **更新 akshare**：
    ```bash
@@ -198,9 +199,10 @@ akshare 接口更新较频繁。本项目通过 `backend/utils/api_compat.py` �
 
 | 日期 | 接口 | 变更说明 | 处理方式 |
 |---|---|---|---|
-| （初始版本） | 所有接口 | 基于 akshare 1.14.x | 参见 api_compat.py |
+| （初始版本） | 所有接口 | 基于 akshare 1.14.x | 参见 source_config.py |
+| 2026-04-10 | 接口配置集中化 | 所有接口定义从 api_compat.py 迁移到 source_config.py | AKSHARE_API_CONFIGS 为唯一权威配置 |
 
-> 如遇接口变更，请在此记录，并更新 api_compat.py。
+> 如遇接口变更，请在此记录，并更新 `backend/data_provider/source_config.py` 中对应的 sources 配置。
 
 ---
 
