@@ -500,6 +500,13 @@ class DataFetcherManager:
         from data_provider.cross_validator import CrossValidator
         from data_provider.error_classifier import classify_error, ErrorCategory
 
+        # 从配置获取超时值
+        try:
+            from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
+        except ImportError:
+            CONCURRENT_FETCH_TIMEOUT = 120.0
+            CONCURRENT_MAX_WORKERS = 7
+
         circuit_breaker = get_daily_circuit_breaker()
         fetchers = self.get_fetchers()
         errors: List[str] = []
@@ -537,7 +544,7 @@ class DataFetcherManager:
 
         # 并发调用所有 Fetcher
         try:
-            max_workers = min(len(fetchers), 7)
+            max_workers = min(len(fetchers), CONCURRENT_MAX_WORKERS)
             with ThreadPoolExecutor(
                 max_workers=max_workers,
                 thread_name_prefix="daily_src",
@@ -546,9 +553,9 @@ class DataFetcherManager:
                     executor.submit(_fetch_from_source, f): f.name
                     for f in fetchers
                 }
-                for future in as_completed(futures, timeout=120):
+                for future in as_completed(futures, timeout=CONCURRENT_FETCH_TIMEOUT):
                     try:
-                        name, df = future.result(timeout=60)
+                        name, df = future.result(timeout=CONCURRENT_FETCH_TIMEOUT / 2)
                         if df is not None and not df.empty:
                             source_results[name] = df
                         elif name:

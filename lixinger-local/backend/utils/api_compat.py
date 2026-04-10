@@ -129,7 +129,8 @@ def call_akshare(api_key: str, **kwargs) -> Any:
     all_tried = []
     api_candidates = [config["primary"]] + config.get("fallbacks", [])
 
-    # 导入错误分类器
+    # 延迟导入错误分类器 (避免循环依赖: data_provider → utils → data_provider)
+    # error_classifier 是独立模块，不依赖 api_compat，所以不会真正循环
     try:
         from data_provider.error_classifier import classify_error, ErrorCategory
     except ImportError:

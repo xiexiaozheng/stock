@@ -221,6 +221,10 @@ class CrossValidator:
                     })
 
         # 计算一致性评分
+        # 公式: 各源在所有(日期×字段)比较中与中位数一致的比例
+        # total_matches: 所有源中匹配中位数的总计数
+        # max_possible: 总比较次数 × 源数量 (每次比较中每个源贡献1次机会)
+        # 结果为 0-1 之间，1 表示所有源在所有比较中完全一致
         if total_comparisons > 0:
             total_matches = sum(match_counts.values())
             max_possible = total_comparisons * len(valid_sources)

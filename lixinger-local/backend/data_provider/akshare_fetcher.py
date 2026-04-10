@@ -214,8 +214,8 @@ class AkshareFetcher(BaseFetcher):
             t0 = time.time()
             df = ak.stock_zh_a_hist_163(
                 symbol=stock_code,
-                start_date=sd.replace("", ""),  # 保持 YYYYMMDD 格式
-                end_date=ed.replace("", ""),
+                start_date=sd,
+                end_date=ed,
             )
             elapsed = time.time() - t0
             if df is not None and not df.empty:
