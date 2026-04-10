@@ -53,9 +53,6 @@ def _build_call_kwargs(api_config: Mapping[str, Any], business_kwargs: Mapping[s
         **dict(business_kwargs),
     }
 
-    for deprecated_key in api_config.get("deprecated_params", []):
-        call_kwargs.pop(deprecated_key, None)
-
     symbol_param = api_config.get("symbol_param")
     symbol_source_param = api_config.get("symbol_source_param", symbol_param)
     symbol_normalizer = api_config.get("symbol_normalizer")
@@ -78,6 +75,10 @@ def _build_call_kwargs(api_config: Mapping[str, Any], business_kwargs: Mapping[s
     param_transformer = api_config.get("param_transformer")
     if callable(param_transformer):
         call_kwargs = dict(param_transformer(call_kwargs))
+
+    for deprecated_key in api_config.get("deprecated_params", []):
+        if deprecated_key != symbol_param:
+            call_kwargs.pop(deprecated_key, None)
 
     supported_params = set(api_config.get("supported_params", []))
     if supported_params:
