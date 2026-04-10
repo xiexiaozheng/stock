@@ -199,9 +199,9 @@ def call_akshare(api_key: str, **kwargs) -> Any:
 
     enabled_sources = list(iter_akshare_sources(api_key, enabled_only=True))
     disabled_sources = list(iter_akshare_sources(api_key, enabled_only=False))
-    disabled_names = {source["source_name"] for source in enabled_sources}
+    enabled_names = {source["source_name"] for source in enabled_sources}
     for source in disabled_sources:
-        if source["source_name"] not in disabled_names and not source.get("enabled", True):
+        if source["source_name"] not in enabled_names and not source.get("enabled", True):
             all_tried.append(
                 {
                     "api": source["api_function"],
