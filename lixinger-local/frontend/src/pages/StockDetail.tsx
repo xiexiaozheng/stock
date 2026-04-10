@@ -1,8 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { stocksApi } from '@/services/api'
-import type { DashboardData, DailyQuote, Financial, Valuation, Dividend } from '@/types'
-import ValuationChart from '@/components/charts/ValuationChart'
+import type { DashboardData, DailyQuote, Financial, Dividend, LatestValuationSnapshot } from '@/types'
 import FinancialChart from '@/components/charts/FinancialChart'
 import KLineChart from '@/components/charts/KLineChart'
 import MetricCard from '@/components/MetricCard'
@@ -16,7 +15,7 @@ const StockDetail: React.FC = () => {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null)
   const [quotes, setQuotes] = useState<DailyQuote[]>([])
   const [financials, setFinancials] = useState<Financial[]>([])
-  const [valuations, setValuations] = useState<Valuation[]>([])
+  const [latestValuation, setLatestValuation] = useState<LatestValuationSnapshot | null>(null)
   const [dividends, setDividends] = useState<Dividend[]>([])
   const [tab, setTab] = useState<Tab>('valuation')
   const [loading, setLoading] = useState(true)
@@ -28,12 +27,12 @@ const StockDetail: React.FC = () => {
     setLoading(true)
     Promise.all([
       stocksApi.getDashboard(code),
-      stocksApi.getValuations(code),
       stocksApi.getFinancials(code, { years: 10 }),
-    ]).then(([d, v, f]) => {
+      stocksApi.getLatestValuation(code).catch(() => null),
+    ]).then(([d, f, v]) => {
       setDashboard(d.data)
-      setValuations(v.data)
       setFinancials(f.data)
+      if (v) setLatestValuation(v.data)
     }).catch(() => {
       navigate('/stocks')
     }).finally(() => setLoading(false))
@@ -57,15 +56,22 @@ const StockDetail: React.FC = () => {
   }
 
   if (!dashboard) return null
-  const { stock, valuation, financial, metrics } = dashboard
+  const { stock, financial, metrics } = dashboard
 
   const fmt = (v?: number | null, decimals = 2) =>
     v !== undefined && v !== null ? v.toFixed(decimals) : '-'
   const fmtB = (v?: number | null) =>
     v !== undefined && v !== null ? (v / 1e8).toFixed(0) + '亿' : '-'
 
+  // 优先使用最新快照中的估值数据
+  const currentPE = latestValuation?.pe_ttm ?? null
+  const currentPB = latestValuation?.pb ?? null
+  const currentMV = latestValuation?.total_mv ?? null
+  const currentClose = latestValuation?.close ?? null
+  const snapshotDate = latestValuation?.trade_date ?? null
+
   const TABS: Array<{ key: Tab; label: string }> = [
-    { key: 'valuation', label: '估值图' },
+    { key: 'valuation', label: '最新估值' },
     { key: 'financial', label: '财务分析' },
     { key: 'dividend', label: '分红历史' },
     { key: 'kline', label: '行情K线' },
@@ -115,28 +121,77 @@ const StockDetail: React.FC = () => {
             ))}
           </div>
 
-          {/* 估值图 */}
+          {/* 最新估值快照 */}
           {tab === 'valuation' && (
             <div className="space-y-4">
-              <div className="card">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="font-medium">PE-TTM 历史走势</h3>
-                  {metrics.pe_percentile !== undefined && (
-                    <span className="text-sm text-text-secondary">
-                      当前分位: <span className="font-mono text-accent">{metrics.pe_percentile?.toFixed(0)}%</span>
-                    </span>
-                  )}
+              {latestValuation ? (
+                <>
+                  <div className="card">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="font-medium">最新估值快照</h3>
+                      <span className="text-sm text-text-secondary">
+                        数据日期: <span className="font-mono">{snapshotDate}</span>
+                        <span className="ml-2 text-xs text-text-muted">(来源: 东方财富实时行情)</span>
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                      <div className="rounded-lg bg-bg-hover p-4 text-center">
+                        <div className="text-text-secondary text-sm mb-1">PE-TTM（动态）</div>
+                        <div className="text-2xl font-mono font-bold text-accent">
+                          {currentPE !== null ? currentPE.toFixed(1) : '-'}
+                        </div>
+                        {metrics.pe_percentile !== undefined && currentPE !== null && (
+                          <div className="text-xs text-text-secondary mt-1">
+                            历史分位 {metrics.pe_percentile?.toFixed(0)}%
+                          </div>
+                        )}
+                      </div>
+                      <div className="rounded-lg bg-bg-hover p-4 text-center">
+                        <div className="text-text-secondary text-sm mb-1">市净率 PB</div>
+                        <div className="text-2xl font-mono font-bold">
+                          {currentPB !== null ? currentPB.toFixed(2) : '-'}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-bg-hover p-4 text-center">
+                        <div className="text-text-secondary text-sm mb-1">总市值</div>
+                        <div className="text-2xl font-mono font-bold">
+                          {currentMV !== null ? fmtB(currentMV) : '-'}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-bg-hover p-4 text-center">
+                        <div className="text-text-secondary text-sm mb-1">最新价</div>
+                        <div className="text-2xl font-mono font-bold">
+                          {currentClose !== null ? currentClose.toFixed(2) : '-'}
+                        </div>
+                      </div>
+                      <div className="rounded-lg bg-bg-hover p-4 text-center">
+                        <div className="text-text-secondary text-sm mb-1">换手率</div>
+                        <div className="text-2xl font-mono font-bold">
+                          {latestValuation.turnover_rate !== null && latestValuation.turnover_rate !== undefined
+                            ? latestValuation.turnover_rate.toFixed(2) + '%'
+                            : '-'}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="card text-sm text-text-secondary">
+                    <p>
+                      💡 <strong>说明</strong>: 此处显示为当日实时快照估值，
+                      非历史 PE/PB 走势图。历史估值序列依赖的数据接口当前不可用。
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <div className="card">
+                  <div className="text-center text-text-muted py-12">
+                    <div className="text-4xl mb-3">📊</div>
+                    <div className="font-medium mb-1">暂无估值快照数据</div>
+                    <div className="text-sm">
+                      请触发数据采集后刷新，或等待系统自动更新（每日增量同步）。
+                    </div>
+                  </div>
                 </div>
-                <ValuationChart
-                  data={valuations}
-                  metric="pe_ttm"
-                  quantiles={metrics.pe_quantiles}
-                />
-              </div>
-              <div className="card">
-                <h3 className="font-medium mb-4">PB 历史走势</h3>
-                <ValuationChart data={valuations} metric="pb" />
-              </div>
+              )}
             </div>
           )}
 
@@ -233,13 +288,12 @@ const StockDetail: React.FC = () => {
         <div className="w-52 shrink-0 space-y-3">
           <MetricCard
             label="PE-TTM"
-            value={fmt(valuation?.pe_ttm, 1)}
+            value={fmt(currentPE, 1)}
             highlight
             percentile={metrics.pe_percentile}
           />
-          <MetricCard label="PB" value={fmt(valuation?.pb, 2)} />
-          <MetricCard label="股息率" value={fmt(valuation?.dividend_yield, 2)} unit="%" />
-          <MetricCard label="市值" value={valuation?.total_market_value ? fmtB(valuation.total_market_value) : '-'} />
+          <MetricCard label="PB" value={fmt(currentPB, 2)} />
+          <MetricCard label="市值" value={currentMV ? fmtB(currentMV) : '-'} />
           <MetricCard label="ROE" value={fmt(financial?.roe, 1)} unit="%" />
           <MetricCard label="毛利率" value={fmt(financial?.gross_margin, 1)} unit="%" />
           <MetricCard label="净利率" value={fmt(financial?.net_margin, 1)} unit="%" />

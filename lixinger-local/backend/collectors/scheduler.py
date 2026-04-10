@@ -122,6 +122,10 @@ class DataCollector:
                 _update_status("incremental", f"核心表进度: {i}/{core_total}")
             self.core.collect_daily_market_valuation(ts_code)
 
+        # 最新估值快照（全市场一次性拉取）
+        _update_status("incremental", "更新最新估值快照...")
+        self.core.collect_latest_valuation_snapshot()
+
         logger.info("=== 增量更新完成 ===")
 
     # ======================== 全量刷新 ========================
@@ -177,6 +181,10 @@ class DataCollector:
 
             self.core.collect_daily_market_valuation(ts_code, force_full=True)
             self.core.collect_quarterly_finance(ts_code)
+
+        # 最新估值快照（全市场一次性拉取）
+        _update_status("full_refresh", "采集最新估值快照...")
+        self.core.collect_latest_valuation_snapshot()
 
         logger.info("=== 全量刷新完成 ===")
 
