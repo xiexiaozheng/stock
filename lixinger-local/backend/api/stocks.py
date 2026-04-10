@@ -17,6 +17,18 @@ router = APIRouter(prefix="/api/stocks", tags=["stocks"])
 logger = logging.getLogger(__name__)
 
 
+def _code_to_ts_code(code: str) -> str:
+    """将纯数字或带后缀的股票代码转换为带后缀的 ts_code（000001 → 000001.SZ）。"""
+    if "." in code:
+        return code  # 已带后缀
+    pure = code.zfill(6)
+    if pure.startswith(("60", "68")):
+        return f"{pure}.SH"
+    elif pure.startswith(("43", "83", "87", "88", "92")):
+        return f"{pure}.BJ"
+    return f"{pure}.SZ"
+
+
 @router.get("", response_model=StockListResponse)
 def list_stocks(
     q: Optional[str] = Query(None, description="搜索关键词（代码或名称）"),
@@ -135,15 +147,7 @@ def get_latest_valuation(code: str, db: Session = Depends(get_db)):
     from models.core import DailyMarketValuation
     from sqlalchemy import or_
 
-    # 推断 ts_code
-    pure = code.split(".")[0] if "." in code else code
-    pure = pure.zfill(6)
-    if pure.startswith(("60", "68")):
-        ts_code = f"{pure}.SH"
-    elif pure.startswith(("43", "83", "87", "88", "92")):
-        ts_code = f"{pure}.BJ"
-    else:
-        ts_code = f"{pure}.SZ"
+    ts_code = _code_to_ts_code(code)
 
     row = (
         db.query(DailyMarketValuation)

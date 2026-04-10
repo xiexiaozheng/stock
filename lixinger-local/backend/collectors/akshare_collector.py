@@ -47,7 +47,7 @@ def _safe_date(val) -> Optional[date]:
         return val
     if isinstance(val, str):
         s = val.strip()
-        # Strip time portion if present: "2024-12-31 00:00:00" or "2024-12-31T00:00:00"
+        # Strip time portion from datetime strings, e.g. "2024-12-31 00:00:00" or "2024-12-31T00:00:00"
         if len(s) > 10 and s[10] in (" ", "T"):
             s = s[:10]
         for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d", "%Y年%m月%d日"):

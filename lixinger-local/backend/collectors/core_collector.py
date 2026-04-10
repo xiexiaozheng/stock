@@ -91,6 +91,14 @@ def _ts_code_to_pure(ts_code: str) -> str:
     return ts_code.split(".")[0] if "." in ts_code else ts_code
 
 
+# 估值快照过滤阈值：屏蔽不合理的 PE/PB 极端值
+# PE 超过 ±100000 或 PB ≤ 0 / > 100000 通常是数据异常（退市、暂停等）
+_PE_TTM_MIN = -10000.0
+_PE_TTM_MAX = 100000.0
+_PB_MIN = 0.0
+_PB_MAX = 100000.0
+
+
 class CoreCollector(BaseCollector):
     """
     核心数据采集器 — 并发多源 + 交叉校验版
@@ -416,10 +424,10 @@ class CoreCollector(BaseCollector):
 
             pe_val = _safe_float(row.get("pe_ttm"))
             pb_val = _safe_float(row.get("pb"))
-            # pe_ttm and pb can be negative (loss-making) or 0; filter out extreme outliers
-            if pe_val is not None and (pe_val <= -10000 or pe_val > 100000):
+            # Filter out extreme outliers (typically from suspended/delisted stocks)
+            if pe_val is not None and (pe_val <= _PE_TTM_MIN or pe_val > _PE_TTM_MAX):
                 pe_val = None
-            if pb_val is not None and (pb_val <= 0 or pb_val > 100000):
+            if pb_val is not None and (pb_val <= _PB_MIN or pb_val > _PB_MAX):
                 pb_val = None
 
             rows.append({
