@@ -1,7 +1,7 @@
 """股票相关数据模型"""
 from datetime import datetime, date
 from typing import Optional
-from sqlalchemy import Column, Integer, String, Boolean, Date, DateTime, BigInteger, Numeric, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, Date, DateTime, BigInteger, Numeric, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from pydantic import BaseModel
 
@@ -47,6 +47,7 @@ class DailyQuote(Base):
     stock = relationship("Stock", back_populates="daily_quotes")
 
     __table_args__ = (
+        UniqueConstraint("stock_code", "trade_date", name="uq_daily_quotes_stock_date"),
         {"sqlite_autoincrement": False},
     )
 
