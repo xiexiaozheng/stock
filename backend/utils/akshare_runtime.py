@@ -46,6 +46,11 @@ def _normalize_mode(mode: Optional[str]) -> str:
     return mode if mode in {"proxy", "direct"} else "proxy"
 
 
+def _set_runtime_mode(mode: str) -> None:
+    _state["mode"] = mode
+    _state["proxy_url"] = AKSHARE_PROXY_URL if _state["proxy_healthy"] and mode == "proxy" else None
+
+
 def _apply_proxy_env(proxy_url: Optional[str]) -> None:
     for env_name in _PROXY_ENV_KEYS:
         if proxy_url:
@@ -102,7 +107,7 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     with _state_lock:
         checked_at = float(_state["checked_at"] or 0.0)
         if not force_refresh and (now - checked_at) < _PROXY_CACHE_TTL:
-            mode = _state["mode"] if _state["proxy_healthy"] else "direct"
+            mode = _normalize_mode(_state["mode"]) if _state["proxy_healthy"] else "direct"
             return AKSHARE_PROXY_URL if mode == "proxy" else None
 
     proxy_healthy = False
@@ -124,9 +129,8 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
         else:
             mode = "direct"
         _state["checked_at"] = now
-        _state["mode"] = mode
         _state["proxy_healthy"] = proxy_healthy
-        _state["proxy_url"] = AKSHARE_PROXY_URL if proxy_healthy and mode == "proxy" else None
+        _set_runtime_mode(mode)
 
     if last_mode and last_mode != mode:
         logger.info("AkShare 网络模式切换为 %s", "代理" if mode == "proxy" else "直连")
@@ -141,14 +145,12 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     with _state_lock:
         if not _state["proxy_healthy"]:
             logger.warning("AkShare 代理不可用，保持直连模式，不执行代理切换")
-            _state["mode"] = "direct"
-            _state["proxy_url"] = None
+            _set_runtime_mode("direct")
             return None
 
         current_mode = _normalize_mode(_state["mode"])
         next_mode = "direct" if current_mode == "proxy" else "proxy"
-        _state["mode"] = next_mode
-        _state["proxy_url"] = AKSHARE_PROXY_URL if next_mode == "proxy" else None
+        _set_runtime_mode(next_mode)
 
     logger.warning(
         "AkShare 重试前切换网络模式为 %s",
