@@ -30,6 +30,7 @@ _PROXY_ENV_KEYS = (
 )
 _NO_PROXY_ENV_KEYS = ("NO_PROXY", "no_proxy")
 _CACHE_TTL_SECONDS = 60.0
+_MIN_PROXY_TIMEOUT_SECONDS = 1.0
 _state_lock = threading.Lock()
 _state = {
     "checked_at": 0.0,
@@ -60,7 +61,7 @@ def _probe_proxy_port(proxy_url: str) -> bool:
     try:
         with socket.create_connection(
             (parsed.hostname, parsed.port),
-            timeout=max(AKSHARE_PROXY_CHECK_TIMEOUT, 1.0),
+            timeout=max(AKSHARE_PROXY_CHECK_TIMEOUT, _MIN_PROXY_TIMEOUT_SECONDS),
         ):
             return True
     except OSError:

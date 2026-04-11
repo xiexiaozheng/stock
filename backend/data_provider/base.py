@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
 from data_provider.realtime_types import (
     UnifiedRealtimeQuote,
     ChipDistribution,
@@ -607,13 +608,6 @@ class DataFetcherManager:
         from data_provider.cross_validator import CrossValidator
         from data_provider.error_classifier import classify_error, ErrorCategory
 
-        # 从配置获取超时值
-        try:
-            from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
-        except ImportError:
-            CONCURRENT_FETCH_TIMEOUT = 120.0
-            CONCURRENT_MAX_WORKERS = 7
-
         circuit_breaker = get_daily_circuit_breaker()
         fetchers = self.get_fetchers(capability="daily_quotes")
         errors: List[str] = []
@@ -870,12 +864,6 @@ class DataFetcherManager:
 
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """并发获取股票列表并聚合。"""
-        try:
-            from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
-        except ImportError:
-            CONCURRENT_FETCH_TIMEOUT = 120.0
-            CONCURRENT_MAX_WORKERS = 7
-
         fetchers = self.get_fetchers(capability="stock_list")
         diagnostic = {
             "attempted_fetchers": [fetcher.name for fetcher in fetchers],

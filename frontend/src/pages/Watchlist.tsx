@@ -23,6 +23,11 @@ const Watchlist: React.FC = () => {
     }
   }
 
+  const getCollectLabel = (scope: 'incremental' | 'full_refresh') =>
+    collectingScope === scope || (collectStatus?.is_running && collectStatus?.last_run_type === scope)
+      ? scope === 'incremental' ? '自选新增更新中...' : '自选全量更新中...'
+      : scope === 'incremental' ? '自选新增更新' : '自选全量更新'
+
   useEffect(() => {
     fetch()
   }, [fetch])
@@ -96,7 +101,7 @@ const Watchlist: React.FC = () => {
             disabled={!items.length || collectingScope !== null || collectStatus?.is_running}
             title={items.length ? '更新全部自选股的新增数据' : '请先添加自选股'}
           >
-            {collectingScope === 'incremental' || (collectStatus?.is_running && collectStatus?.last_run_type === 'incremental') ? '自选新增更新中...' : '自选新增更新'}
+            {getCollectLabel('incremental')}
           </button>
           <button
             className="btn-secondary text-sm"
@@ -104,7 +109,7 @@ const Watchlist: React.FC = () => {
             disabled={!items.length || collectingScope !== null || collectStatus?.is_running}
             title={items.length ? '重新全量更新全部自选股' : '请先添加自选股'}
           >
-            {collectingScope === 'full_refresh' || (collectStatus?.is_running && collectStatus?.last_run_type === 'full_refresh') ? '自选全量更新中...' : '自选全量更新'}
+            {getCollectLabel('full_refresh')}
           </button>
           {items.length > 0 && (
             <button className="btn-secondary text-sm" onClick={exportCsv}>导出 CSV</button>
