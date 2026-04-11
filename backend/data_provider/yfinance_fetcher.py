@@ -31,6 +31,7 @@ from data_provider.error_classifier import (
     ErrorCategory,
     get_adaptive_limiter,
 )
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 
@@ -100,12 +101,18 @@ class YFinanceFetcher(BaseFetcher):
             )
             t0 = time.time()
 
-            df = yf.download(
-                tickers=yf_symbol,
-                start=start_date,
-                end=end_date,
-                auto_adjust=True,
-                progress=False,
+            df = execute_with_proxy_retry(
+                "YFinance",
+                "download",
+                lambda: yf.download(
+                    tickers=yf_symbol,
+                    start=start_date,
+                    end=end_date,
+                    auto_adjust=True,
+                    progress=False,
+                ),
+                max_attempts=2,
+                backoff_seconds=1.0,
             )
 
             elapsed = time.time() - t0
@@ -186,9 +193,13 @@ class YFinanceFetcher(BaseFetcher):
         """通过 yfinance 获取股票名称"""
         self._limiter.wait()
         try:
-            yf = self._get_yf()
-            ticker = yf.Ticker(self._to_yf_symbol(stock_code))
-            info = ticker.info
+            info = execute_with_proxy_retry(
+                "YFinance",
+                "Ticker.info",
+                lambda: self._get_yf().Ticker(self._to_yf_symbol(stock_code)).info,
+                max_attempts=2,
+                backoff_seconds=1.0,
+            )
             self._limiter.record_success()
             return info.get("shortName") or info.get("longName")
         except Exception as e:

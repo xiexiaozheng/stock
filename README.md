@@ -144,13 +144,13 @@ docker-compose up -d
 
 ## 通过手机出口为 AkShare 配置代理
 
-如果 CloudCone 节点直接抓取国内站点容易被封，可以把 **手机 Ubuntu 的网络出口** 作为 AkShare 代理出口。当前仓库已经支持通过 `AKSHARE_PROXY_URL` 注入标准 `HTTP(S)_PROXY/ALL_PROXY` 环境变量，适合和你现有的 **V2Ray + TLS + WebSocket + Nginx + Cloudflare** 转发链路一起使用。AkShare 某个源如果在重试中被判定为疑似短时封禁，下一次重试会在“代理 / 直连”之间自动切换；同时系统仍会定期检测代理健康状态，若代理不可用，则保持直连而不会强行切换。
+如果 CloudCone 节点直接抓取国内站点容易被封，可以把 **手机 Ubuntu 的网络出口** 作为应用侧代理出口。当前仓库已经支持通过 `AKSHARE_PROXY_URL` 注入标准 `HTTP(S)_PROXY/ALL_PROXY` 环境变量，适合和你现有的 **V2Ray + TLS + WebSocket + Nginx + Cloudflare** 转发链路一起使用。现在不仅 AkShare，Baostock、Efinance、Tushare、YFinance、雪球直连、东财直连等出站请求也会复用这套“代理 / 直连”切换逻辑；一旦遇到可重试错误，下一次重试会自动切换网络模式并打印日志提示当前已切换后重试。同时系统仍会定期检测代理健康状态，若代理不可用，则保持直连而不会强行切换。
 
 推荐按下面三层理解：
 
 1. **手机 Ubuntu 侧**：启动一个本地 HTTP 代理监听端口（建议 `127.0.0.1:10809`），由手机直接访问国内站点；你现有的手机客户端/Ubuntu 侧程序负责把请求真正从手机网络发出。
 2. **CloudCone 侧转发**：现有 Nginx + WebSocket + TLS 配置继续负责把 CloudCone 与手机之间的流量隧道打通；额外再准备一个 CloudCone 本地可访问的 HTTP 转发端口，把它转到手机上的 `10809`。
-3. **应用侧**：让 backend 把 AkShare/requests 的出站请求都发到这个本地转发端口。
+3. **应用侧**：让 backend 把 AkShare 以及其他依赖 HTTP 出站的数据源请求都发到这个本地转发端口。
 
 最小可用示例（Docker 部署）：
 

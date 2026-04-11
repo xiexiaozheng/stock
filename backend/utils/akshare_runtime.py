@@ -1,4 +1,4 @@
-"""AkShare 运行时代理管理。"""
+"""出站请求运行时代理管理。"""
 from __future__ import annotations
 
 import logging
@@ -6,7 +6,7 @@ import os
 import socket
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 from urllib.parse import urlparse
 
 import requests
@@ -17,8 +17,10 @@ from config import (
     AKSHARE_PROXY_TEST_URL,
     AKSHARE_PROXY_URL,
 )
+from data_provider.error_classifier import ErrorCategory, classify_error
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY",
@@ -49,6 +51,14 @@ def _normalize_mode(mode: Optional[str]) -> str:
 
 def _resolve_effective_mode(proxy_healthy: bool, mode: Optional[str]) -> str:
     return _normalize_mode(mode) if proxy_healthy else "direct"
+
+
+def _mode_label(mode_or_proxy_url: Optional[str]) -> str:
+    if mode_or_proxy_url == "proxy":
+        return "代理"
+    if AKSHARE_PROXY_URL and mode_or_proxy_url == AKSHARE_PROXY_URL:
+        return "代理"
+    return "直连"
 
 
 def _set_runtime_mode(mode: str) -> None:
@@ -120,10 +130,10 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     if AKSHARE_PROXY_URL:
         if _probe_proxy_port(AKSHARE_PROXY_URL) and _probe_proxy_request(AKSHARE_PROXY_URL):
             proxy_healthy = True
-            logger.info("AkShare 代理可用: %s", AKSHARE_PROXY_URL)
+            logger.info("出站代理可用: %s", AKSHARE_PROXY_URL)
         else:
             logger.warning(
-                "AkShare 代理不可用，切换为直连: %s",
+                "出站代理不可用，切换为直连: %s",
                 AKSHARE_PROXY_URL,
             )
 
@@ -135,13 +145,27 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
         _set_runtime_mode(mode)
 
     if last_mode and last_mode != mode:
-        logger.info("AkShare 网络模式切换为 %s", "代理" if mode == "proxy" else "直连")
+        logger.info("出站网络模式切换为 %s", _mode_label(mode))
 
     return AKSHARE_PROXY_URL if proxy_healthy and mode == "proxy" else None
 
 
-def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
-    """在代理健康时切换 AkShare 下一次重试使用的网络模式。
+def prepare_network_runtime(
+    client_name: str = "外部数据源",
+    force_refresh: bool = False,
+) -> Optional[str]:
+    """在每次外部调用前动态切换代理环境变量。"""
+    proxy_url = _resolve_proxy_mode(force_refresh=force_refresh)
+    _apply_proxy_env(proxy_url)
+    logger.debug("%s 当前网络模式: %s", client_name, _mode_label(proxy_url))
+    return proxy_url
+
+
+def toggle_proxy_mode(
+    client_name: str = "外部数据源",
+    force_refresh: bool = False,
+) -> Optional[str]:
+    """在代理健康时切换下一次重试使用的网络模式。
 
     返回代理地址表示下一次重试将走代理；返回 None 表示下一次重试将直连。
     """
@@ -150,7 +174,7 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
     with _state_lock:
         if not _state["proxy_healthy"]:
-            logger.warning("AkShare 代理不可用，保持直连模式，不执行代理切换")
+            logger.warning("%s 代理不可用，保持直连模式，不执行代理切换", client_name)
             _set_runtime_mode("direct")
             return None
 
@@ -159,14 +183,78 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
         _set_runtime_mode(next_mode)
 
     logger.info(
-        "AkShare 重试前切换网络模式为 %s",
-        "代理" if next_mode == "proxy" else "直连",
+        "%s 重试前切换网络模式为 %s",
+        client_name,
+        _mode_label(next_mode),
     )
     return AKSHARE_PROXY_URL if next_mode == "proxy" else None
 
 
+def execute_with_proxy_retry(
+    client_name: str,
+    operation_name: str,
+    func: Callable[[], T],
+    *,
+    max_attempts: int = 1,
+    backoff_seconds: float = 0.0,
+) -> T:
+    """执行外部调用，并在可重试错误时切换直连/代理后重试。"""
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max(max_attempts, 1) + 1):
+        should_force_refresh_proxy = attempt >= 2
+        try:
+            prepare_network_runtime(client_name=client_name, force_refresh=should_force_refresh_proxy)
+            return func()
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            category = classify_error(exc)
+            should_retry = attempt < max_attempts and category in {
+                ErrorCategory.TRANSIENT,
+                ErrorCategory.ANTI_CRAWL,
+                ErrorCategory.UNKNOWN,
+            }
+            if not should_retry:
+                if category == ErrorCategory.ANTI_CRAWL:
+                    logger.warning(
+                        "%s %s 疑似被短时封禁，已达到最大重试次数: %s",
+                        client_name,
+                        operation_name,
+                        exc,
+                    )
+                raise
+
+            sleep_seconds = max(
+                backoff_seconds,
+                0.5 if category == ErrorCategory.TRANSIENT else 3.0,
+            ) * attempt
+            next_proxy_url = toggle_proxy_mode(
+                client_name=client_name,
+                force_refresh=should_force_refresh_proxy,
+            )
+            logger.warning(
+                "%s %s 调用失败 [%s]，已切换为%s并准备重试 (%s/%s)，%.1fs 后重试: %s",
+                client_name,
+                operation_name,
+                category.value,
+                _mode_label(next_proxy_url),
+                attempt,
+                max_attempts,
+                sleep_seconds,
+                exc,
+            )
+            time.sleep(sleep_seconds)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unexpected empty execution state for {client_name}.{operation_name}")
+
+
+def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
+    """兼容旧接口：切换 AkShare 下一次重试使用的网络模式。"""
+    return toggle_proxy_mode(client_name="AkShare", force_refresh=force_refresh)
+
+
 def prepare_akshare_runtime(force_refresh: bool = False) -> Optional[str]:
-    """在每次 AkShare 调用前动态切换代理。"""
-    proxy_url = _resolve_proxy_mode(force_refresh=force_refresh)
-    _apply_proxy_env(proxy_url)
-    return proxy_url
+    """兼容旧接口：在每次 AkShare 调用前动态切换代理。"""
+    return prepare_network_runtime(client_name="AkShare", force_refresh=force_refresh)

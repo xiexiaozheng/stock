@@ -39,6 +39,7 @@ from data_provider.realtime_types import (
     safe_float,
     safe_int,
 )
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +131,18 @@ class TushareFetcher(BaseFetcher):
         """
         self._enforce_rate_limit()
         try:
-            pro = self._get_pro()
-            func = getattr(pro, method_name)
-            df = func(**params)
+            def _invoke() -> Optional[pd.DataFrame]:
+                pro = self._get_pro()
+                func = getattr(pro, method_name)
+                return func(**params)
+
+            df = execute_with_proxy_retry(
+                "Tushare",
+                method_name,
+                _invoke,
+                max_attempts=2,
+                backoff_seconds=1.0,
+            )
             return df
         except Exception as e:
             logger.warning(
