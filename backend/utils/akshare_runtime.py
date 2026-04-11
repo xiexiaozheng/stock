@@ -42,6 +42,7 @@ _state = {
 
 
 def _normalize_mode(mode: Optional[str]) -> str:
+    # 代理健康且未发生封禁切换时，默认仍优先复用历史上的“代理优先”行为。
     return mode if mode in {"proxy", "direct"} else "proxy"
 
 
@@ -139,7 +140,7 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
     with _state_lock:
         if not _state["proxy_healthy"]:
-            logger.info("AkShare 代理不可用，保持直连模式，不执行代理切换")
+            logger.warning("AkShare 代理不可用，保持直连模式，不执行代理切换")
             _state["mode"] = "direct"
             _state["proxy_url"] = None
             return None
