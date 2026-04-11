@@ -28,13 +28,14 @@ import random
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
 from data_provider.realtime_types import (
     UnifiedRealtimeQuote,
     ChipDistribution,
@@ -607,13 +608,6 @@ class DataFetcherManager:
         from data_provider.cross_validator import CrossValidator
         from data_provider.error_classifier import classify_error, ErrorCategory
 
-        # 从配置获取超时值
-        try:
-            from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
-        except ImportError:
-            CONCURRENT_FETCH_TIMEOUT = 120.0
-            CONCURRENT_MAX_WORKERS = 7
-
         circuit_breaker = get_daily_circuit_breaker()
         fetchers = self.get_fetchers(capability="daily_quotes")
         errors: List[str] = []
@@ -886,14 +880,16 @@ class DataFetcherManager:
 
         results: Dict[str, pd.DataFrame] = {}
         with ThreadPoolExecutor(
-            max_workers=max(1, len(fetchers)),
+            max_workers=max(1, min(len(fetchers), CONCURRENT_MAX_WORKERS)),
             thread_name_prefix="stock_list",
         ) as executor:
             futures = {executor.submit(fetcher.get_stock_list): fetcher.name for fetcher in fetchers}
-            for future in as_completed(futures, timeout=60):
+            # 股票列表是全市场请求，个别源响应会明显慢于日线接口，因此保留至少 60s 的总等待窗口。
+            done, not_done = wait(futures, timeout=max(60.0, CONCURRENT_FETCH_TIMEOUT))
+            for future in done:
                 name = futures[future]
                 try:
-                    df = future.result(timeout=20)
+                    df = future.result()
                     if df is not None and not df.empty:
                         results[name] = df
                         diagnostic["successful_fetchers"].append(name)
@@ -904,6 +900,15 @@ class DataFetcherManager:
                     diagnostic["failed_fetchers"].append(name)
                     diagnostic["failure_reasons"][name] = str(exc)
                     logger.warning("[DataFetcherManager] %s 股票列表失败: %s", name, exc)
+            for future in not_done:
+                name = futures[future]
+                future.cancel()
+                diagnostic["failed_fetchers"].append(name)
+                diagnostic["failure_reasons"][name] = "股票列表获取超时"
+                logger.warning(
+                    "[DataFetcherManager] %s 股票列表获取超时，已跳过未完成任务",
+                    name,
+                )
 
         if not results:
             self._last_request_diagnostics["stock_list"] = diagnostic

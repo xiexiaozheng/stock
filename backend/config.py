@@ -20,23 +20,10 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost
 AKSHARE_REQUEST_INTERVAL = float(os.getenv("AKSHARE_REQUEST_INTERVAL", "0.8"))  # 秒
 AKSHARE_MAX_RETRIES = int(os.getenv("AKSHARE_MAX_RETRIES", "3"))
 CHROME_MCP_INTERVAL = float(os.getenv("CHROME_MCP_INTERVAL", "3.0"))  # 秒
-AKSHARE_PROXY_URL = os.getenv("AKSHARE_PROXY_URL", "").strip()
+AKSHARE_PROXY_URL = os.getenv("AKSHARE_PROXY_URL", "http://127.0.0.1:11080").strip()
 AKSHARE_PROXY_NO_PROXY = os.getenv("AKSHARE_PROXY_NO_PROXY", "").strip()
-
-if AKSHARE_PROXY_URL:
-    for env_name in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ):
-        os.environ.setdefault(env_name, AKSHARE_PROXY_URL)
-
-if AKSHARE_PROXY_NO_PROXY:
-    for env_name in ("NO_PROXY", "no_proxy"):
-        os.environ[env_name] = AKSHARE_PROXY_NO_PROXY
+AKSHARE_PROXY_TEST_URL = os.getenv("AKSHARE_PROXY_TEST_URL", "https://quote.eastmoney.com").strip()
+AKSHARE_PROXY_CHECK_TIMEOUT = float(os.getenv("AKSHARE_PROXY_CHECK_TIMEOUT", "3.0"))
 
 # =====================================================================
 # 并发多源采集配置

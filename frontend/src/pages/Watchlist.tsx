@@ -13,13 +13,48 @@ const Watchlist: React.FC = () => {
   const [collectingScope, setCollectingScope] = useState<'incremental' | 'full_refresh' | null>(null)
   const [collectMessage, setCollectMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
+  const refreshCollectStatus = async () => {
+    try {
+      const { data } = await collectApi.getStatus()
+      setCollectStatus(data)
+      return data
+    } catch {
+      return null
+    }
+  }
+
+  const getCollectLabel = (scope: 'incremental' | 'full_refresh') => {
+    const isRunning = collectingScope === scope
+      || (collectStatus?.is_running && collectStatus?.last_run_type === scope)
+
+    if (scope === 'incremental') {
+      return isRunning ? '自选新增更新中...' : '自选新增更新'
+    }
+
+    return isRunning ? '自选全量更新中...' : '自选全量更新'
+  }
+
   useEffect(() => {
     fetch()
   }, [fetch])
 
   useEffect(() => {
-    collectApi.getStatus().then(({ data }) => setCollectStatus(data)).catch(() => undefined)
+    refreshCollectStatus().catch(() => undefined)
   }, [])
+
+  useEffect(() => {
+    if (!collectStatus?.is_running) {
+      if (collectMessage?.type === 'success' && collectStatus?.last_run) {
+        fetch().catch(() => undefined)
+      }
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      refreshCollectStatus().catch(() => undefined)
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [collectStatus?.is_running, collectStatus?.last_run, collectMessage?.type, fetch])
 
   const exportCsv = () => {
     if (!items.length) return
@@ -41,10 +76,9 @@ const Watchlist: React.FC = () => {
       const { data } = await collectApi.trigger(scope, items.map(item => item.stock_code))
       setCollectMessage({
         type: 'success',
-        text: `${scope === 'incremental' ? '自选增量扫描' : '自选全量扫描'}已启动：${data.message}`,
+        text: `${scope === 'incremental' ? '自选股新增更新' : '自选股全量更新'}已启动：${data.message}`,
       })
-      const status = await collectApi.getStatus()
-      setCollectStatus(status.data)
+      await refreshCollectStatus()
     } catch (error: unknown) {
       const message = typeof error === 'object'
         && error !== null
@@ -71,15 +105,17 @@ const Watchlist: React.FC = () => {
             className="btn-secondary text-sm"
             onClick={() => handleTriggerCollect('incremental')}
             disabled={!items.length || collectingScope !== null || collectStatus?.is_running}
+            title={items.length ? '更新全部自选股的新增数据' : '请先添加自选股'}
           >
-            {collectingScope === 'incremental' ? '自选增量扫描中...' : '自选增量扫描'}
+            {getCollectLabel('incremental')}
           </button>
           <button
             className="btn-secondary text-sm"
             onClick={() => handleTriggerCollect('full_refresh')}
             disabled={!items.length || collectingScope !== null || collectStatus?.is_running}
+            title={items.length ? '重新全量更新全部自选股' : '请先添加自选股'}
           >
-            {collectingScope === 'full_refresh' ? '自选全量扫描中...' : '自选全量扫描'}
+            {getCollectLabel('full_refresh')}
           </button>
           {items.length > 0 && (
             <button className="btn-secondary text-sm" onClick={exportCsv}>导出 CSV</button>
