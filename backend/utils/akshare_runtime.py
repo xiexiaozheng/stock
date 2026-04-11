@@ -42,8 +42,8 @@ _state = {
 
 
 def _normalize_mode(mode: Optional[str]) -> str:
-    # 历史实现中只要代理健康就默认走代理；因此这里对 None / 非法值都回落为 proxy，
-    # 仅在发生封禁重试时再切到直连。
+    # 历史实现中只要代理健康就默认走代理；因此这里对 None / 非法值都回落为 proxy。
+    # 真正的“封禁重试时切到直连/代理”由 toggle_akshare_proxy_mode() 负责。
     return mode if mode in {"proxy", "direct"} else "proxy"
 
 
@@ -145,7 +145,7 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
     返回代理地址表示下一次重试将走代理；返回 None 表示下一次重试将直连。
     """
-    # 先刷新/复用最近一次健康检查结果，避免在代理已经失效时仍尝试切换到代理模式。
+    # _resolve_proxy_mode() 会同步刷新/复用 _state 里的代理健康状态，后续直接读取即可。
     _resolve_proxy_mode(force_refresh=force_refresh)
 
     with _state_lock:

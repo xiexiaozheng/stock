@@ -19,6 +19,7 @@ from data_provider.error_classifier import ErrorCategory, classify_error
 from utils.akshare_runtime import prepare_akshare_runtime, toggle_akshare_proxy_mode
 
 logger = logging.getLogger(__name__)
+_PROXY_REFRESH_RETRY_ATTEMPT = 2
 
 
 class AkshareAPIError(Exception):
@@ -125,7 +126,8 @@ def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapp
 
     for attempt in range(1, max_attempts + 1):
         try:
-            prepare_akshare_runtime(force_refresh=(attempt > 1))
+            should_force_refresh_proxy = attempt >= _PROXY_REFRESH_RETRY_ATTEMPT
+            prepare_akshare_runtime(force_refresh=should_force_refresh_proxy)
             import akshare as ak
 
             func = _resolve_function(ak, source_config["api_function"])
@@ -141,7 +143,7 @@ def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapp
             if should_retry:
                 sleep_seconds = max(backoff_seconds, 0.5 if category == ErrorCategory.TRANSIENT else 3.0) * attempt
                 if category == ErrorCategory.ANTI_CRAWL:
-                    toggle_akshare_proxy_mode(force_refresh=(attempt > 1))
+                    toggle_akshare_proxy_mode(force_refresh=should_force_refresh_proxy)
                     logger.warning(
                         "akshare 接口 %s 疑似被短时封禁，等待中 %.1fs 后重试 (%s/%s): %s",
                         source_config.get("api_function"),
