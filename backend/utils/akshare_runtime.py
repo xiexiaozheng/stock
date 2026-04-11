@@ -41,6 +41,10 @@ _state = {
 }
 
 
+def _normalize_mode(mode: Optional[str]) -> str:
+    return mode if mode in {"proxy", "direct"} else "proxy"
+
+
 def _apply_proxy_env(proxy_url: Optional[str]) -> None:
     for env_name in _PROXY_ENV_KEYS:
         if proxy_url:
@@ -115,7 +119,7 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     with _state_lock:
         last_mode = _state["mode"]
         if proxy_healthy:
-            mode = _state["mode"] if _state["mode"] in {"proxy", "direct"} else "proxy"
+            mode = _normalize_mode(_state["mode"])
         else:
             mode = "direct"
         _state["checked_at"] = now
@@ -140,7 +144,7 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
             _state["proxy_url"] = None
             return None
 
-        current_mode = _state["mode"] if _state["mode"] in {"proxy", "direct"} else "proxy"
+        current_mode = _normalize_mode(_state["mode"])
         next_mode = "direct" if current_mode == "proxy" else "proxy"
         _state["mode"] = next_mode
         _state["proxy_url"] = AKSHARE_PROXY_URL if next_mode == "proxy" else None
