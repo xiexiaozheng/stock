@@ -42,7 +42,7 @@ _state = {
 
 
 def _normalize_mode(mode: Optional[str]) -> str:
-    # 代理健康且未发生封禁切换时，默认仍优先复用历史上的“代理优先”行为。
+    # 历史实现中只要代理健康就默认走代理；这里保留该默认值，仅在发生封禁重试时再切到直连。
     return mode if mode in {"proxy", "direct"} else "proxy"
 
 
@@ -139,7 +139,10 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
 
 def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
-    """在代理健康时切换 AkShare 下一次重试使用的网络模式。"""
+    """在代理健康时切换 AkShare 下一次重试使用的网络模式。
+
+    返回代理地址表示下一次重试将走代理；返回 None 表示下一次重试将直连。
+    """
     _resolve_proxy_mode(force_refresh=force_refresh)
 
     with _state_lock:
@@ -152,7 +155,7 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
         next_mode = "direct" if current_mode == "proxy" else "proxy"
         _set_runtime_mode(next_mode)
 
-    logger.warning(
+    logger.info(
         "AkShare 重试前切换网络模式为 %s",
         "代理" if next_mode == "proxy" else "直连",
     )
