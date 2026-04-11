@@ -122,11 +122,12 @@ def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapp
     retry_policy = source_config.get("retry_policy", {}) or {}
     max_attempts = max(int(retry_policy.get("max_attempts", 1)), 1)
     backoff_seconds = float(retry_policy.get("backoff_seconds", 0.0) or 0.0)
-    def _invoke() -> Any:
-            import akshare as ak
+    import akshare as ak
 
-            func = _resolve_function(ak, source_config["api_function"])
-            return func(**call_kwargs)
+    def _invoke() -> Any:
+        func = _resolve_function(ak, source_config["api_function"])
+        return func(**call_kwargs)
+
     return execute_with_proxy_retry(
         "AkShare",
         str(source_config.get("api_function")),
