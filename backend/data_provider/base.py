@@ -884,6 +884,7 @@ class DataFetcherManager:
             thread_name_prefix="stock_list",
         ) as executor:
             futures = {executor.submit(fetcher.get_stock_list): fetcher.name for fetcher in fetchers}
+            # 股票列表是全市场请求，个别源响应会明显慢于日线接口，因此保留至少 60s 的总等待窗口。
             done, not_done = wait(futures, timeout=max(60.0, CONCURRENT_FETCH_TIMEOUT))
             for future in done:
                 name = futures[future]

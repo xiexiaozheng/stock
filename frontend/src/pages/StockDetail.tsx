@@ -54,6 +54,17 @@ const StockDetail: React.FC = () => {
     }
   }
 
+  const getCollectLabel = (scope: 'incremental' | 'full_refresh') => {
+    const isRunning = collectingScope === scope
+      || (collectStatus?.is_running && collectStatus?.last_run_type === scope)
+
+    if (scope === 'incremental') {
+      return isRunning ? '新增更新中...' : '新增更新'
+    }
+
+    return isRunning ? '全量更新中...' : '全量更新'
+  }
+
   useEffect(() => {
     loadDashboard().catch(() => undefined)
   }, [code])
@@ -165,7 +176,7 @@ const StockDetail: React.FC = () => {
             disabled={collectingScope !== null || collectStatus?.is_running}
             title="仅更新当前股票的新增数据"
           >
-            {collectingScope === 'incremental' || (collectStatus?.is_running && collectStatus?.last_run_type === 'incremental') ? '新增更新中...' : '新增更新'}
+            {getCollectLabel('incremental')}
           </button>
           <button
             className="btn-secondary"
@@ -173,7 +184,7 @@ const StockDetail: React.FC = () => {
             disabled={collectingScope !== null || collectStatus?.is_running}
             title="重新全量更新当前股票"
           >
-            {collectingScope === 'full_refresh' || (collectStatus?.is_running && collectStatus?.last_run_type === 'full_refresh') ? '全量更新中...' : '全量更新'}
+            {getCollectLabel('full_refresh')}
           </button>
           <button
             className={watched ? 'btn-secondary' : 'btn-primary'}

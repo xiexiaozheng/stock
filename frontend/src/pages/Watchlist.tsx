@@ -23,10 +23,16 @@ const Watchlist: React.FC = () => {
     }
   }
 
-  const getCollectLabel = (scope: 'incremental' | 'full_refresh') =>
-    collectingScope === scope || (collectStatus?.is_running && collectStatus?.last_run_type === scope)
-      ? scope === 'incremental' ? '自选新增更新中...' : '自选全量更新中...'
-      : scope === 'incremental' ? '自选新增更新' : '自选全量更新'
+  const getCollectLabel = (scope: 'incremental' | 'full_refresh') => {
+    const isRunning = collectingScope === scope
+      || (collectStatus?.is_running && collectStatus?.last_run_type === scope)
+
+    if (scope === 'incremental') {
+      return isRunning ? '自选新增更新中...' : '自选新增更新'
+    }
+
+    return isRunning ? '自选全量更新中...' : '自选全量更新'
+  }
 
   useEffect(() => {
     fetch()
