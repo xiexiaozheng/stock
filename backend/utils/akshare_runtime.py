@@ -36,8 +36,24 @@ _state_lock = threading.Lock()
 _state = {
     "checked_at": 0.0,
     "mode": None,
+    "proxy_healthy": False,
     "proxy_url": None,
 }
+
+
+def _normalize_mode(mode: Optional[str]) -> str:
+    # 历史实现中只要代理健康就默认走代理；因此这里对 None / 非法值都回落为 proxy。
+    # 真正的“封禁重试时切到直连/代理”由 toggle_akshare_proxy_mode() 负责。
+    return mode if mode in {"proxy", "direct"} else "proxy"
+
+
+def _resolve_effective_mode(proxy_healthy: bool, mode: Optional[str]) -> str:
+    return _normalize_mode(mode) if proxy_healthy else "direct"
+
+
+def _set_runtime_mode(mode: str) -> None:
+    _state["mode"] = mode
+    _state["proxy_url"] = AKSHARE_PROXY_URL if _state["proxy_healthy"] and mode == "proxy" else None
 
 
 def _apply_proxy_env(proxy_url: Optional[str]) -> None:
@@ -96,15 +112,15 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     with _state_lock:
         checked_at = float(_state["checked_at"] or 0.0)
         if not force_refresh and (now - checked_at) < _PROXY_CACHE_TTL:
-            return _state["proxy_url"]
+            mode = _resolve_effective_mode(_state["proxy_healthy"], _state["mode"])
+            return AKSHARE_PROXY_URL if mode == "proxy" else None
 
-    proxy_url: Optional[str] = None
+    proxy_healthy = False
     mode = "direct"
     if AKSHARE_PROXY_URL:
         if _probe_proxy_port(AKSHARE_PROXY_URL) and _probe_proxy_request(AKSHARE_PROXY_URL):
-            proxy_url = AKSHARE_PROXY_URL
-            mode = "proxy"
-            logger.info("AkShare 代理可用，使用 %s", AKSHARE_PROXY_URL)
+            proxy_healthy = True
+            logger.info("AkShare 代理可用: %s", AKSHARE_PROXY_URL)
         else:
             logger.warning(
                 "AkShare 代理不可用，切换为直连: %s",
@@ -113,14 +129,40 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
     with _state_lock:
         last_mode = _state["mode"]
+        mode = _resolve_effective_mode(proxy_healthy, _state["mode"])
         _state["checked_at"] = now
-        _state["mode"] = mode
-        _state["proxy_url"] = proxy_url
+        _state["proxy_healthy"] = proxy_healthy
+        _set_runtime_mode(mode)
 
     if last_mode and last_mode != mode:
         logger.info("AkShare 网络模式切换为 %s", "代理" if mode == "proxy" else "直连")
 
-    return proxy_url
+    return AKSHARE_PROXY_URL if proxy_healthy and mode == "proxy" else None
+
+
+def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
+    """在代理健康时切换 AkShare 下一次重试使用的网络模式。
+
+    返回代理地址表示下一次重试将走代理；返回 None 表示下一次重试将直连。
+    """
+    # _resolve_proxy_mode() 会同步刷新/复用 _state 里的代理健康状态，后续直接读取即可。
+    _resolve_proxy_mode(force_refresh=force_refresh)
+
+    with _state_lock:
+        if not _state["proxy_healthy"]:
+            logger.warning("AkShare 代理不可用，保持直连模式，不执行代理切换")
+            _set_runtime_mode("direct")
+            return None
+
+        current_mode = _normalize_mode(_state["mode"])
+        next_mode = "direct" if current_mode == "proxy" else "proxy"
+        _set_runtime_mode(next_mode)
+
+    logger.info(
+        "AkShare 重试前切换网络模式为 %s",
+        "代理" if next_mode == "proxy" else "直连",
+    )
+    return AKSHARE_PROXY_URL if next_mode == "proxy" else None
 
 
 def prepare_akshare_runtime(force_refresh: bool = False) -> Optional[str]:
