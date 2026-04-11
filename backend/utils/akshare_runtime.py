@@ -42,8 +42,13 @@ _state = {
 
 
 def _normalize_mode(mode: Optional[str]) -> str:
-    # 历史实现中只要代理健康就默认走代理；这里保留该默认值，仅在发生封禁重试时再切到直连。
+    # 历史实现中只要代理健康就默认走代理；因此这里对 None / 非法值都回落为 proxy，
+    # 仅在发生封禁重试时再切到直连。
     return mode if mode in {"proxy", "direct"} else "proxy"
+
+
+def _resolve_effective_mode(proxy_healthy: bool, mode: Optional[str]) -> str:
+    return _normalize_mode(mode) if proxy_healthy else "direct"
 
 
 def _set_runtime_mode(mode: str) -> None:
@@ -107,7 +112,7 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     with _state_lock:
         checked_at = float(_state["checked_at"] or 0.0)
         if not force_refresh and (now - checked_at) < _PROXY_CACHE_TTL:
-            mode = _normalize_mode(_state["mode"]) if _state["proxy_healthy"] else "direct"
+            mode = _resolve_effective_mode(_state["proxy_healthy"], _state["mode"])
             return AKSHARE_PROXY_URL if mode == "proxy" else None
 
     proxy_healthy = False
@@ -124,10 +129,7 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
     with _state_lock:
         last_mode = _state["mode"]
-        if proxy_healthy:
-            mode = _normalize_mode(_state["mode"])
-        else:
-            mode = "direct"
+        mode = _resolve_effective_mode(proxy_healthy, _state["mode"])
         _state["checked_at"] = now
         _state["proxy_healthy"] = proxy_healthy
         _set_runtime_mode(mode)
@@ -143,6 +145,7 @@ def toggle_akshare_proxy_mode(force_refresh: bool = False) -> Optional[str]:
 
     返回代理地址表示下一次重试将走代理；返回 None 表示下一次重试将直连。
     """
+    # 先刷新/复用最近一次健康检查结果，避免在代理已经失效时仍尝试切换到代理模式。
     _resolve_proxy_mode(force_refresh=force_refresh)
 
     with _state_lock:
