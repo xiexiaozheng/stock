@@ -149,7 +149,7 @@ class BaostockFetcher(BaseFetcher):
 
                     if rs.error_code != "0":
                         raise DataFetchError(
-                            f"Baostock query_history_k_data_plus 失败: {rs.error_msg}"
+                            f"{self.name} query_history_k_data_plus 失败: {rs.error_msg}"
                         )
 
                     data_list = []
@@ -248,7 +248,7 @@ class BaostockFetcher(BaseFetcher):
 
                     if rs.error_code != "0":
                         raise DataFetchError(
-                            f"Baostock query_adjust_factor 失败: {rs.error_msg}"
+                            f"{self.name} query_adjust_factor 失败: {rs.error_msg}"
                         )
 
                     data_list = []
@@ -286,7 +286,7 @@ class BaostockFetcher(BaseFetcher):
                     rs = bs.query_stock_basic(code=bs_code)
                     if rs.error_code != "0":
                         raise DataFetchError(
-                            f"Baostock query_stock_basic 失败: {rs.error_msg}"
+                            f"{self.name} query_stock_basic 失败: {rs.error_msg}"
                         )
                     if rs.next():
                         data = rs.get_row_data()
@@ -311,7 +311,7 @@ class BaostockFetcher(BaseFetcher):
 
                     if rs.error_code != "0":
                         raise DataFetchError(
-                            f"Baostock query_stock_basic 失败: {rs.error_msg}"
+                            f"{self.name} query_stock_basic 失败: {rs.error_msg}"
                         )
 
                     data_list = []

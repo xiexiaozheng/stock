@@ -54,7 +54,9 @@ def _resolve_effective_mode(proxy_healthy: bool, mode: Optional[str]) -> str:
 
 
 def _mode_label(mode_or_proxy_url: Optional[str]) -> str:
-    if mode_or_proxy_url in {"proxy", AKSHARE_PROXY_URL}:
+    if mode_or_proxy_url == "proxy":
+        return "代理"
+    if AKSHARE_PROXY_URL and mode_or_proxy_url == AKSHARE_PROXY_URL:
         return "代理"
     return "直连"
 
