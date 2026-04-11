@@ -35,6 +35,7 @@ from data_provider.realtime_types import (
     safe_float,
     safe_int,
 )
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,15 @@ class EfinanceFetcher(BaseFetcher):
             self._ef = ef
         return self._ef
 
+    def _execute_with_retry(self, operation_name: str, func):
+        return execute_with_proxy_retry(
+            "Efinance",
+            operation_name,
+            func,
+            max_attempts=2,
+            backoff_seconds=1.0,
+        )
+
     # ---- 防封禁 ----
 
     def _enforce_rate_limit(self) -> None:
@@ -85,21 +95,22 @@ class EfinanceFetcher(BaseFetcher):
         """
         self._enforce_rate_limit()
         try:
-            ef = self._get_ef()
             logger.info(
                 f"[EfinanceFetcher] ef.stock.get_quote_history"
                 f"({stock_code}, {start_date}, {end_date})"
             )
             t0 = time.time()
 
-            # efinance 日期格式: YYYYMMDD
             beg = start_date.replace("-", "")
             end = end_date.replace("-", "")
 
-            df = ef.stock.get_quote_history(
-                stock_codes=stock_code,
-                beg=beg,
-                end=end,
+            df = self._execute_with_retry(
+                "stock.get_quote_history",
+                lambda: self._get_ef().stock.get_quote_history(
+                    stock_codes=stock_code,
+                    beg=beg,
+                    end=end,
+                ),
             )
 
             elapsed = time.time() - t0
@@ -170,8 +181,10 @@ class EfinanceFetcher(BaseFetcher):
         self._enforce_rate_limit()
         code = normalize_stock_code(stock_code)
         try:
-            ef = self._get_ef()
-            df = ef.stock.get_realtime_quotes([code])
+            df = self._execute_with_retry(
+                "stock.get_realtime_quotes",
+                lambda: self._get_ef().stock.get_realtime_quotes([code]),
+            )
             if df is None or df.empty:
                 return None
 
@@ -213,9 +226,11 @@ class EfinanceFetcher(BaseFetcher):
         """
         self._enforce_rate_limit()
         try:
-            ef = self._get_ef()
             code = normalize_stock_code(stock_code)
-            info = ef.stock.get_base_info(code)
+            info = self._execute_with_retry(
+                "stock.get_base_info",
+                lambda: self._get_ef().stock.get_base_info(code),
+            )
             if info is not None:
                 return dict(info) if hasattr(info, "to_dict") else info
         except Exception as e:
@@ -232,8 +247,10 @@ class EfinanceFetcher(BaseFetcher):
         """
         self._enforce_rate_limit()
         try:
-            ef = self._get_ef()
-            df = ef.stock.get_realtime_quotes()
+            df = self._execute_with_retry(
+                "stock.get_realtime_quotes",
+                lambda: self._get_ef().stock.get_realtime_quotes(),
+            )
             if df is None or df.empty:
                 return None
 
@@ -272,8 +289,10 @@ class EfinanceFetcher(BaseFetcher):
         """
         self._enforce_rate_limit()
         try:
-            ef = self._get_ef()
-            df = ef.stock.get_realtime_quotes(["行业板块"])
+            df = self._execute_with_retry(
+                "stock.get_realtime_quotes",
+                lambda: self._get_ef().stock.get_realtime_quotes(["行业板块"]),
+            )
             if df is None or df.empty:
                 return None
 

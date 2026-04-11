@@ -11,6 +11,7 @@ import requests
 
 from data_provider.base import normalize_stock_code
 from data_provider.error_classifier import get_adaptive_limiter
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,13 @@ class XueqiuClient:
         try:
             self._limiter.wait()
             self._session.headers["User-Agent"] = random.choice(_USER_AGENTS)
-            response = self._session.get(f"https://xueqiu.com/S/{symbol}", timeout=10)
+            response = execute_with_proxy_retry(
+                "Xueqiu",
+                "cookie",
+                lambda: self._session.get(f"https://xueqiu.com/S/{symbol}", timeout=10),
+                max_attempts=2,
+                backoff_seconds=1.0,
+            )
             response.raise_for_status()
             self._cookie_expires_at = now + 1800
             self._limiter.record_success()
@@ -69,7 +76,13 @@ class XueqiuClient:
             self._ensure_cookie(symbol)
             self._limiter.wait()
             self._session.headers["User-Agent"] = random.choice(_USER_AGENTS)
-            response = self._session.get(url, params=params, timeout=10)
+            response = execute_with_proxy_retry(
+                "Xueqiu",
+                "api",
+                lambda: self._session.get(url, params=params, timeout=10),
+                max_attempts=2,
+                backoff_seconds=1.0,
+            )
             response.raise_for_status()
             payload = response.json()
             self._limiter.record_success()

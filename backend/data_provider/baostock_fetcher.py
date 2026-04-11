@@ -30,6 +30,7 @@ from data_provider.base import (
     is_bse_code,
 )
 from data_provider.realtime_types import safe_float
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,8 @@ class BaostockFetcher(BaseFetcher):
 
     name = "BaostockFetcher"
     framework_key = "baostock"
+    retry_max_attempts = 2
+    retry_backoff_seconds = 1.0
 
     def __init__(self):
         super().__init__()
@@ -92,6 +95,15 @@ class BaostockFetcher(BaseFetcher):
             return f"sh.{code}"
         return f"sz.{code}"
 
+    def _execute_with_retry(self, operation_name: str, func):
+        return execute_with_proxy_retry(
+            "Baostock",
+            operation_name,
+            func,
+            max_attempts=self.retry_max_attempts,
+            backoff_seconds=self.retry_backoff_seconds,
+        )
+
     # ---- 日K线 (必须实现) ----
 
     def _fetch_raw_data(
@@ -115,43 +127,45 @@ class BaostockFetcher(BaseFetcher):
         self.random_sleep(0.5, 1.5)
 
         try:
-            with self._baostock_session() as bs:
-                logger.info(
-                    f"[BaostockFetcher] query_history_k_data_plus"
-                    f"({bs_code}, {start_date}, {end_date})"
-                )
-
-                fields = (
-                    "date,open,high,low,close,volume,amount,"
-                    "pctChg,turn,isST"
-                )
-                rs = bs.query_history_k_data_plus(
-                    code=bs_code,
-                    fields=fields,
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency="d",
-                    adjustflag="2",  # 前复权
-                )
-
-                if rs.error_code != "0":
-                    logger.warning(
-                        f"[BaostockFetcher] 查询失败: {rs.error_msg}"
+            def _query_history() -> pd.DataFrame:
+                with self._baostock_session() as bs:
+                    logger.info(
+                        f"[BaostockFetcher] query_history_k_data_plus"
+                        f"({bs_code}, {start_date}, {end_date})"
                     )
-                    return pd.DataFrame()
 
-                data_list = []
-                while rs.error_code == "0" and rs.next():
-                    data_list.append(rs.get_row_data())
+                    fields = (
+                        "date,open,high,low,close,volume,amount,"
+                        "pctChg,turn,isST"
+                    )
+                    rs = bs.query_history_k_data_plus(
+                        code=bs_code,
+                        fields=fields,
+                        start_date=start_date,
+                        end_date=end_date,
+                        frequency="d",
+                        adjustflag="2",  # 前复权
+                    )
 
-                if not data_list:
-                    return pd.DataFrame()
+                    if rs.error_code != "0":
+                        raise DataFetchError(
+                            f"Baostock query_history_k_data_plus 失败: {rs.error_msg}"
+                        )
 
-                df = pd.DataFrame(data_list, columns=rs.fields)
-                logger.info(
-                    f"[BaostockFetcher] 获取 {len(df)} 行数据"
-                )
-                return df
+                    data_list = []
+                    while rs.error_code == "0" and rs.next():
+                        data_list.append(rs.get_row_data())
+
+                    if not data_list:
+                        return pd.DataFrame()
+
+                    df = pd.DataFrame(data_list, columns=rs.fields)
+                    logger.info(
+                        f"[BaostockFetcher] 获取 {len(df)} 行数据"
+                    )
+                    return df
+
+            return self._execute_with_retry("query_history_k_data_plus", _query_history)
 
         except DataFetchError:
             raise
@@ -219,36 +233,38 @@ class BaostockFetcher(BaseFetcher):
         self.random_sleep(0.5, 1.0)
 
         try:
-            with self._baostock_session() as bs:
-                logger.info(
-                    f"[BaostockFetcher] query_adjust_factor"
-                    f"({bs_code}, {start_date}, {end_date})"
-                )
-
-                rs = bs.query_adjust_factor(
-                    code=bs_code,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-
-                if rs.error_code != "0":
-                    logger.warning(
-                        f"[BaostockFetcher] 复权因子查询失败: {rs.error_msg}"
+            def _query_adjust_factor() -> Optional[pd.DataFrame]:
+                with self._baostock_session() as bs:
+                    logger.info(
+                        f"[BaostockFetcher] query_adjust_factor"
+                        f"({bs_code}, {start_date}, {end_date})"
                     )
-                    return None
 
-                data_list = []
-                while rs.error_code == "0" and rs.next():
-                    data_list.append(rs.get_row_data())
+                    rs = bs.query_adjust_factor(
+                        code=bs_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
 
-                if not data_list:
-                    return None
+                    if rs.error_code != "0":
+                        raise DataFetchError(
+                            f"Baostock query_adjust_factor 失败: {rs.error_msg}"
+                        )
 
-                df = pd.DataFrame(data_list, columns=rs.fields)
-                logger.info(
-                    f"[BaostockFetcher] 复权因子 {len(df)} 行"
-                )
-                return df
+                    data_list = []
+                    while rs.error_code == "0" and rs.next():
+                        data_list.append(rs.get_row_data())
+
+                    if not data_list:
+                        return None
+
+                    df = pd.DataFrame(data_list, columns=rs.fields)
+                    logger.info(
+                        f"[BaostockFetcher] 复权因子 {len(df)} 行"
+                    )
+                    return df
+
+            return self._execute_with_retry("query_adjust_factor", _query_adjust_factor)
 
         except Exception as e:
             logger.warning(f"[BaostockFetcher] 复权因子获取失败: {e}")
@@ -265,13 +281,20 @@ class BaostockFetcher(BaseFetcher):
         bs_code = self._convert_stock_code(code)
 
         try:
-            with self._baostock_session() as bs:
-                rs = bs.query_stock_basic(code=bs_code)
-                if rs.error_code == "0" and rs.next():
-                    data = rs.get_row_data()
-                    # code_name 通常在第2列
-                    if len(data) >= 2:
-                        return str(data[1]).strip() or None
+            def _query_stock_name() -> Optional[str]:
+                with self._baostock_session() as bs:
+                    rs = bs.query_stock_basic(code=bs_code)
+                    if rs.error_code != "0":
+                        raise DataFetchError(
+                            f"Baostock query_stock_basic 失败: {rs.error_msg}"
+                        )
+                    if rs.next():
+                        data = rs.get_row_data()
+                        if len(data) >= 2:
+                            return str(data[1]).strip() or None
+                    return None
+
+            return self._execute_with_retry("query_stock_basic", _query_stock_name)
         except Exception as e:
             logger.warning(f"[BaostockFetcher] 股票名称获取失败: {e}")
 
@@ -282,20 +305,25 @@ class BaostockFetcher(BaseFetcher):
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """获取全市场股票列表"""
         try:
-            with self._baostock_session() as bs:
-                rs = bs.query_stock_basic()
+            def _query_stock_list() -> Optional[pd.DataFrame]:
+                with self._baostock_session() as bs:
+                    rs = bs.query_stock_basic()
 
-                if rs.error_code != "0":
-                    return None
+                    if rs.error_code != "0":
+                        raise DataFetchError(
+                            f"Baostock query_stock_basic 失败: {rs.error_msg}"
+                        )
 
-                data_list = []
-                while rs.error_code == "0" and rs.next():
-                    data_list.append(rs.get_row_data())
+                    data_list = []
+                    while rs.error_code == "0" and rs.next():
+                        data_list.append(rs.get_row_data())
 
-                if not data_list:
-                    return None
+                    if not data_list:
+                        return None
 
-                return pd.DataFrame(data_list, columns=rs.fields)
+                    return pd.DataFrame(data_list, columns=rs.fields)
+
+            return self._execute_with_retry("query_stock_basic", _query_stock_list)
         except Exception as e:
             logger.warning(f"[BaostockFetcher] 股票列表获取失败: {e}")
             return None

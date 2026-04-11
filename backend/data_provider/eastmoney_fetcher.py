@@ -41,6 +41,7 @@ from data_provider.error_classifier import (
     ErrorCategory,
     get_adaptive_limiter,
 )
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,22 @@ class EastmoneyFetcher(BaseFetcher):
             self._session.headers["User-Agent"] = random.choice(_USER_AGENTS)
         return self._session
 
+    def _request_json(self, operation_name: str, url: str, *, params: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        def _invoke() -> Dict[str, Any]:
+            session = self._get_session()
+            response = session.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+
+        payload = execute_with_proxy_retry(
+            "Eastmoney",
+            operation_name,
+            _invoke,
+            max_attempts=2,
+            backoff_seconds=1.0,
+        )
+        return payload if isinstance(payload, dict) else {}
+
     # ---- 日K线 (必须实现) ----
 
     def _fetch_raw_data(
@@ -152,18 +169,18 @@ class EastmoneyFetcher(BaseFetcher):
         }
 
         try:
-            session = self._get_session()
             logger.info(
                 f"[EastmoneyFetcher] 直连东财日K线: "
                 f"secid={secid}, {start_date}~{end_date}"
             )
             t0 = time.time()
 
-            resp = session.get(
-                self.KLINE_URL, params=params, timeout=15
+            data = self._request_json(
+                "kline",
+                self.KLINE_URL,
+                params=params,
+                timeout=15,
             )
-            resp.raise_for_status()
-            data = resp.json()
 
             elapsed = time.time() - t0
 
@@ -250,12 +267,12 @@ class EastmoneyFetcher(BaseFetcher):
         }
 
         try:
-            session = self._get_session()
-            resp = session.get(
-                self.QUOTE_URL, params=params, timeout=10
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
+            data = self._request_json(
+                "quote",
+                self.QUOTE_URL,
+                params=params,
+                timeout=10,
+            ).get("data", {})
 
             if not data:
                 return None

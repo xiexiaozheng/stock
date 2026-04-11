@@ -16,7 +16,7 @@ from data_provider.source_config import (
     iter_akshare_sources,
 )
 from data_provider.error_classifier import ErrorCategory, classify_error
-from utils.akshare_runtime import prepare_akshare_runtime, toggle_akshare_proxy_mode
+from utils.akshare_runtime import execute_with_proxy_retry
 
 logger = logging.getLogger(__name__)
 _PROXY_REFRESH_RETRY_ATTEMPT = 2
@@ -122,58 +122,18 @@ def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapp
     retry_policy = source_config.get("retry_policy", {}) or {}
     max_attempts = max(int(retry_policy.get("max_attempts", 1)), 1)
     backoff_seconds = float(retry_policy.get("backoff_seconds", 0.0) or 0.0)
-    last_error: Optional[Exception] = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            should_force_refresh_proxy = attempt >= _PROXY_REFRESH_RETRY_ATTEMPT
-            prepare_akshare_runtime(force_refresh=should_force_refresh_proxy)
+    def _invoke() -> Any:
             import akshare as ak
 
             func = _resolve_function(ak, source_config["api_function"])
             return func(**call_kwargs)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            category = classify_error(exc)
-            should_retry = attempt < max_attempts and category in (
-                ErrorCategory.TRANSIENT,
-                ErrorCategory.ANTI_CRAWL,
-                ErrorCategory.UNKNOWN,
-            )
-            if should_retry:
-                sleep_seconds = max(backoff_seconds, 0.5 if category == ErrorCategory.TRANSIENT else 3.0) * attempt
-                if category == ErrorCategory.ANTI_CRAWL:
-                    toggle_akshare_proxy_mode(force_refresh=should_force_refresh_proxy)
-                    logger.warning(
-                        "akshare 接口 %s 疑似被短时封禁，等待中 %.1fs 后重试 (%s/%s): %s",
-                        source_config.get("api_function"),
-                        sleep_seconds,
-                        attempt,
-                        max_attempts,
-                        exc,
-                    )
-                else:
-                    logger.warning(
-                        "akshare source %s transient failure on attempt %s/%s: %s; retry in %.1fs",
-                        source_config.get("api_function"),
-                        attempt,
-                        max_attempts,
-                        exc,
-                        sleep_seconds,
-                    )
-                time.sleep(sleep_seconds)
-                continue
-            if category == ErrorCategory.ANTI_CRAWL:
-                logger.warning(
-                    "akshare 接口 %s 疑似被短时封禁，已达到最大重试次数: %s",
-                    source_config.get("api_function"),
-                    exc,
-                )
-            raise
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(f"Unexpected empty execution state for {source_config['api_function']}")
+    return execute_with_proxy_retry(
+        "AkShare",
+        str(source_config.get("api_function")),
+        _invoke,
+        max_attempts=max_attempts,
+        backoff_seconds=backoff_seconds,
+    )
 
 
 def _find_source_config(api_key: str, source_name: str) -> Dict[str, Any]:
