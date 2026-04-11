@@ -149,7 +149,7 @@ class AdaptiveRateLimiter:
             if self._current_interval > self.base_interval:
                 logger.warning(
                     "[AdaptiveRateLimiter] 等待中，%.2fs 后重试 "
-                    "(当前间隔: %.2fs，可能触发了网站短时限制)",
+                    "(当前间隔: %.2fs，可能触发了网站短时限速)",
                     wait_time,
                     self._current_interval,
                 )

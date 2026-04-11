@@ -30,7 +30,7 @@ _PROXY_ENV_KEYS = (
 )
 _NO_PROXY_ENV_KEYS = ("NO_PROXY", "no_proxy")
 # 60s 内复用代理探测结果，避免每次 akshare 调用都额外探测一次远程桥接代理。
-_CACHE_TTL_SECONDS = 60.0
+_PROXY_CACHE_TTL = 60.0
 _MIN_PROXY_TIMEOUT_SECONDS = 1.0
 _state_lock = threading.Lock()
 _state = {
@@ -95,7 +95,7 @@ def _resolve_proxy_mode(force_refresh: bool = False) -> Optional[str]:
     now = time.time()
     with _state_lock:
         checked_at = float(_state["checked_at"] or 0.0)
-        if not force_refresh and (now - checked_at) < _CACHE_TTL_SECONDS:
+        if not force_refresh and (now - checked_at) < _PROXY_CACHE_TTL:
             return _state["proxy_url"]
 
     proxy_url: Optional[str] = None

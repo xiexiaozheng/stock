@@ -85,9 +85,13 @@ const StockDetail: React.FC = () => {
   useEffect(() => {
     if (!collectStatus?.is_running) {
       if (collectMessage?.type === 'success' && collectStatus?.last_run) {
-        setQuotes([])
-        setDividends([])
         loadDashboard().catch(() => undefined)
+        if (tab === 'kline') {
+          stocksApi.getQuotes(code).then(r => setQuotes(r.data)).catch(() => undefined)
+        }
+        if (tab === 'dividend') {
+          stocksApi.getDividends(code).then(r => setDividends(r.data)).catch(() => undefined)
+        }
       }
       return
     }
