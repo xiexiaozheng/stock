@@ -152,7 +152,7 @@ docker-compose up -d
 2. **CloudCone 侧转发**：现有 Nginx + WebSocket + TLS 配置继续负责把 CloudCone 与手机之间的流量隧道打通；额外再准备一个 CloudCone 本地可访问的 HTTP 转发端口，把它转到手机上的 `10809`。
 3. **应用侧**：让 backend 把 AkShare/requests 的出站请求都发到这个本地转发端口。
 
-示例（Docker 部署）：
+最小可用示例（Docker 部署）：
 
 ```bash
 export AKSHARE_PROXY_URL=http://host.docker.internal:10809
@@ -168,6 +168,134 @@ docker-compose up -d --build
 ```bash
 export AKSHARE_PROXY_NO_PROXY=127.0.0.1,localhost,backend
 ```
+
+### CloudCone ↔ 手机 Ubuntu 落地示例
+
+下面给一套**最容易先跑通**的方案：手机 Ubuntu 提供本地 HTTP 代理，手机再主动连回 CloudCone 暴露一个仅本机可访问的反向端口。  
+如果你已经有现成的 V2Ray / Xray / Nginx / Cloudflare 转发链路，也可以把下面示例里的 `11080 -> 10809` 映射替换成你现有链路暴露出来的本地端口，应用侧配置保持不变。
+
+#### 1）手机 Ubuntu：启动 HTTP 代理
+
+可以用 `tinyproxy`，也可以换成你更熟悉的 `3proxy/gost/squid`。下面是 `tinyproxy` 示例：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y tinyproxy autossh
+sudo cp /etc/tinyproxy/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf.bak
+sudo tee /etc/tinyproxy/tinyproxy.conf >/dev/null <<'EOF'
+User tinyproxy
+Group tinyproxy
+Port 10809
+Listen 127.0.0.1
+Timeout 600
+DefaultErrorFile "/usr/share/tinyproxy/default.html"
+StatFile "/usr/share/tinyproxy/stats.html"
+LogFile "/var/log/tinyproxy/tinyproxy.log"
+LogLevel Info
+PidFile "/run/tinyproxy/tinyproxy.pid"
+MaxClients 100
+Allow 127.0.0.1
+ViaProxyName "phone-akshare-proxy"
+EOF
+sudo systemctl restart tinyproxy
+sudo systemctl enable tinyproxy
+curl -x http://127.0.0.1:10809 https://www.baidu.com | head
+```
+
+#### 2）手机 Ubuntu：把代理端口反向暴露到 CloudCone
+
+先确保 CloudCone 机器允许 SSH 登录，然后在手机 Ubuntu 上执行：
+
+```bash
+autossh -M 0 -f -N \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -R 127.0.0.1:11080:127.0.0.1:10809 \
+  <cloudcone_user>@<cloudcone_ip>
+```
+
+这条命令的含义是：
+
+- CloudCone 本机打开 `127.0.0.1:11080`
+- 实际请求通过 SSH 反向隧道转发到手机 Ubuntu 的 `127.0.0.1:10809`
+- AkShare 只需要把代理地址指向 CloudCone 本地的 `11080`
+
+如果你想常驻运行，可以在手机 Ubuntu 上创建 systemd 服务：
+
+```ini
+# /etc/systemd/system/akshare-proxy-tunnel.service
+[Unit]
+Description=Reverse tunnel for AkShare proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<your_user>
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -R 127.0.0.1:11080:127.0.0.1:10809 \
+  <cloudcone_user>@<cloudcone_ip>
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now akshare-proxy-tunnel
+```
+
+#### 3）CloudCone：确认本地代理端口已打通
+
+在 CloudCone 上执行：
+
+```bash
+curl -x http://127.0.0.1:11080 https://www.baidu.com | head
+curl -x http://127.0.0.1:11080 https://quote.eastmoney.com | head
+```
+
+如果能返回页面内容，说明 CloudCone → 手机 Ubuntu 的代理链路已经通了。
+
+#### 4）应用侧：让 AkShare 走手机出口
+
+如果后端直接运行在 CloudCone 宿主机上：
+
+```bash
+export AKSHARE_PROXY_URL=http://127.0.0.1:11080
+export AKSHARE_PROXY_NO_PROXY=127.0.0.1,localhost
+cd /path/to/stock
+python scripts/check_akshare.py
+```
+
+如果后端跑在本仓库的 Docker Compose 里：
+
+```bash
+export AKSHARE_PROXY_URL=http://host.docker.internal:11080
+export AKSHARE_PROXY_NO_PROXY=127.0.0.1,localhost,backend
+docker-compose up -d --build
+```
+
+这里使用 `host.docker.internal`，是因为容器访问的是 CloudCone 宿主机上的 `11080`。
+
+#### 5）和你现有 V2Ray / Nginx 配置怎么对应
+
+- 你当前的 **Nginx + TLS + WebSocket + Cloudflare** 入口可以继续保留，不需要改动应用代码
+- 关键不是协议本身，而是**最终在 CloudCone 本机上拿到一个可访问的 HTTP 代理端口**
+- 只要你的现有链路最终能在 CloudCone 暴露出类似 `127.0.0.1:11080` 的端口，就把：
+  - 宿主机部署：`AKSHARE_PROXY_URL=http://127.0.0.1:11080`
+  - Docker 部署：`AKSHARE_PROXY_URL=http://host.docker.internal:11080`
+- 如果你现有链路暴露的是 SOCKS5 端口，也可以直接写成：
+
+```bash
+export AKSHARE_PROXY_URL=socks5h://host.docker.internal:11080
+```
+
+其中 `socks5h` 表示域名解析也走远端代理，更适合规避 CloudCone 本地 DNS 暴露。
 
 前端现在也支持：
 
