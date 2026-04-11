@@ -146,10 +146,18 @@ class AdaptiveRateLimiter:
             wait_time = max(0, self._current_interval - elapsed)
 
         if wait_time > 0:
-            logger.debug(
-                f"[AdaptiveRateLimiter] 等待 {wait_time:.2f}s "
-                f"(当前间隔: {self._current_interval:.2f}s)"
-            )
+            if self._current_interval > self.base_interval:
+                logger.warning(
+                    "[AdaptiveRateLimiter] 等待中，%.2fs 后重试 "
+                    "(当前间隔: %.2fs，可能触发了网站短时限制)",
+                    wait_time,
+                    self._current_interval,
+                )
+            else:
+                logger.debug(
+                    f"[AdaptiveRateLimiter] 等待 {wait_time:.2f}s "
+                    f"(当前间隔: {self._current_interval:.2f}s)"
+                )
             time.sleep(wait_time)
 
         with self._lock:

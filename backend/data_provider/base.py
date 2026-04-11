@@ -28,7 +28,7 @@ import random
 import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -870,6 +870,12 @@ class DataFetcherManager:
 
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """并发获取股票列表并聚合。"""
+        try:
+            from config import CONCURRENT_FETCH_TIMEOUT, CONCURRENT_MAX_WORKERS
+        except ImportError:
+            CONCURRENT_FETCH_TIMEOUT = 120.0
+            CONCURRENT_MAX_WORKERS = 7
+
         fetchers = self.get_fetchers(capability="stock_list")
         diagnostic = {
             "attempted_fetchers": [fetcher.name for fetcher in fetchers],
@@ -886,14 +892,15 @@ class DataFetcherManager:
 
         results: Dict[str, pd.DataFrame] = {}
         with ThreadPoolExecutor(
-            max_workers=max(1, len(fetchers)),
+            max_workers=max(1, min(len(fetchers), CONCURRENT_MAX_WORKERS)),
             thread_name_prefix="stock_list",
         ) as executor:
             futures = {executor.submit(fetcher.get_stock_list): fetcher.name for fetcher in fetchers}
-            for future in as_completed(futures, timeout=60):
+            done, not_done = wait(futures, timeout=max(60.0, CONCURRENT_FETCH_TIMEOUT))
+            for future in done:
                 name = futures[future]
                 try:
-                    df = future.result(timeout=20)
+                    df = future.result()
                     if df is not None and not df.empty:
                         results[name] = df
                         diagnostic["successful_fetchers"].append(name)
@@ -904,6 +911,15 @@ class DataFetcherManager:
                     diagnostic["failed_fetchers"].append(name)
                     diagnostic["failure_reasons"][name] = str(exc)
                     logger.warning("[DataFetcherManager] %s 股票列表失败: %s", name, exc)
+            for future in not_done:
+                name = futures[future]
+                future.cancel()
+                diagnostic["failed_fetchers"].append(name)
+                diagnostic["failure_reasons"][name] = "股票列表获取超时"
+                logger.warning(
+                    "[DataFetcherManager] %s 股票列表获取超时，已跳过未完成任务",
+                    name,
+                )
 
         if not results:
             self._last_request_diagnostics["stock_list"] = diagnostic

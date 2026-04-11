@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from data_provider.realtime_types import safe_float
+from utils.akshare_runtime import prepare_akshare_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ class FundamentalAdapter:
 
         尝试多个 akshare 接口候选。
         """
+        prepare_akshare_runtime()
         import akshare as ak
 
         growth = {}
@@ -263,6 +265,7 @@ class FundamentalAdapter:
 
         尝试 akshare 财务摘要接口。
         """
+        prepare_akshare_runtime()
         import akshare as ak
 
         earnings = {}
@@ -291,6 +294,7 @@ class FundamentalAdapter:
 
         尝试 akshare 机构持仓接口。
         """
+        prepare_akshare_runtime()
         import akshare as ak
 
         institution = {}
@@ -342,6 +346,7 @@ class FundamentalAdapter:
         Fail-open: 返回空字典而非抛异常。
         """
         try:
+            prepare_akshare_runtime()
             import akshare as ak
             time.sleep(1)
             df = ak.stock_individual_fund_flow(stock=stock_code, market="")
@@ -377,6 +382,7 @@ class FundamentalAdapter:
         Fail-open: 返回空字典而非抛异常。
         """
         try:
+            prepare_akshare_runtime()
             import akshare as ak
             time.sleep(1)
             today = datetime.today().strftime("%Y%m%d")

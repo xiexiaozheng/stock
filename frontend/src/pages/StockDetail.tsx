@@ -25,21 +25,38 @@ const StockDetail: React.FC = () => {
   const { add, remove, isInWatchlist } = useWatchlistStore()
   const watched = isInWatchlist(code)
 
-  useEffect(() => {
+  const loadDashboard = async () => {
     if (!code) return
     setLoading(true)
-    Promise.all([
-      stocksApi.getDashboard(code),
-      stocksApi.getFinancials(code, { years: 10 }),
-      stocksApi.getLatestValuation(code).catch(() => null),
-    ]).then(([d, f, v]) => {
+    try {
+      const [d, f, v] = await Promise.all([
+        stocksApi.getDashboard(code),
+        stocksApi.getFinancials(code, { years: 10 }),
+        stocksApi.getLatestValuation(code).catch(() => null),
+      ])
       setDashboard(d.data)
       setFinancials(f.data)
       if (v) setLatestValuation(v.data)
-    }).catch(() => {
+    } catch {
       navigate('/stocks')
-    }).finally(() => setLoading(false))
-  }, [code, navigate])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const refreshCollectStatus = async () => {
+    try {
+      const { data } = await collectApi.getStatus()
+      setCollectStatus(data)
+      return data
+    } catch {
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadDashboard().catch(() => undefined)
+  }, [code])
 
   useEffect(() => {
     if (tab === 'kline' && !quotes.length) {
@@ -51,8 +68,24 @@ const StockDetail: React.FC = () => {
   }, [tab, code, quotes.length, dividends.length])
 
   useEffect(() => {
-    collectApi.getStatus().then(({ data }) => setCollectStatus(data)).catch(() => undefined)
+    refreshCollectStatus().catch(() => undefined)
   }, [])
+
+  useEffect(() => {
+    if (!collectStatus?.is_running) {
+      if (collectMessage?.type === 'success' && collectStatus?.last_run) {
+        setQuotes([])
+        setDividends([])
+        loadDashboard().catch(() => undefined)
+      }
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      refreshCollectStatus().catch(() => undefined)
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [collectStatus?.is_running, collectStatus?.last_run, collectMessage?.type])
 
   const handleTriggerCollect = async (scope: 'incremental' | 'full_refresh') => {
     if (!code) return
@@ -62,10 +95,9 @@ const StockDetail: React.FC = () => {
       const { data } = await collectApi.trigger(scope, [code])
       setCollectMessage({
         type: 'success',
-        text: `${scope === 'incremental' ? '增量扫描' : '全量扫描'}已启动：${data.message}`,
+        text: `${scope === 'incremental' ? '当前股票新增更新' : '当前股票全量更新'}已启动：${data.message}`,
       })
-      const status = await collectApi.getStatus()
-      setCollectStatus(status.data)
+      await refreshCollectStatus()
     } catch (error: unknown) {
       const message = typeof error === 'object'
         && error !== null
@@ -131,15 +163,17 @@ const StockDetail: React.FC = () => {
             className="btn-secondary"
             onClick={() => handleTriggerCollect('incremental')}
             disabled={collectingScope !== null || collectStatus?.is_running}
+            title="仅更新当前股票的新增数据"
           >
-            {collectingScope === 'incremental' ? '增量扫描中...' : '增量扫描'}
+            {collectingScope === 'incremental' || (collectStatus?.is_running && collectStatus?.last_run_type === 'incremental') ? '新增更新中...' : '新增更新'}
           </button>
           <button
             className="btn-secondary"
             onClick={() => handleTriggerCollect('full_refresh')}
             disabled={collectingScope !== null || collectStatus?.is_running}
+            title="重新全量更新当前股票"
           >
-            {collectingScope === 'full_refresh' ? '全量扫描中...' : '全量扫描'}
+            {collectingScope === 'full_refresh' || (collectStatus?.is_running && collectStatus?.last_run_type === 'full_refresh') ? '全量更新中...' : '全量更新'}
           </button>
           <button
             className={watched ? 'btn-secondary' : 'btn-primary'}

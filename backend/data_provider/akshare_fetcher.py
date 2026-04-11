@@ -52,6 +52,7 @@ from data_provider.source_config import (
     get_cross_validation_config,
     iter_akshare_sources,
 )
+from utils.akshare_runtime import prepare_akshare_runtime
 from utils.api_compat import call_akshare, call_akshare_source
 
 logger = logging.getLogger(__name__)
@@ -457,15 +458,15 @@ class AkshareFetcher(BaseFetcher):
         else:
             self._enforce_rate_limit()
             try:
-                import akshare as ak
-                logger.info("[AkshareFetcher] ak.stock_zh_a_spot_em() 获取A股实时行情...")
+                prepare_akshare_runtime()
+                logger.info("[AkshareFetcher] stock_zh_a_spot_em() 获取A股实时行情...")
                 t0 = time.time()
 
                 # 重试机制（参考 daily_stock_analysis）
                 last_error = None
                 for attempt in range(1, 3):
                     try:
-                        df = ak.stock_zh_a_spot_em()
+                        df = call_akshare("stock_realtime")
                         if df is not None and not df.empty:
                             break
                     except Exception as e:
@@ -546,6 +547,7 @@ class AkshareFetcher(BaseFetcher):
         """
         self._enforce_rate_limit()
         try:
+            prepare_akshare_runtime()
             import akshare as ak
             # 尝试新浪全市场行情
             try:

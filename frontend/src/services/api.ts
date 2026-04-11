@@ -45,6 +45,8 @@ export const stocksApi = {
 
   getLatestValuation: (code: string) =>
     api.get<LatestValuationSnapshot>(`/stocks/${code}/latest-valuation`),
+
+  getXueqiu: (code: string) => api.get(`/stocks/${code}/xueqiu`),
 }
 
 // ======================== 筛选器 ========================

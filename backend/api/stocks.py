@@ -12,6 +12,7 @@ from models.stock import Stock, DailyQuote, StockResponse, StockListResponse, Da
 from models.financial import Financial, FinancialResponse
 from models.valuation import Valuation, Dividend, ValuationResponse, DividendResponse
 from analyzers.metrics import calc_percentile, calc_quantile_levels, calc_growth_rate
+from data_provider.xueqiu_client import XueqiuClient
 
 router = APIRouter(prefix="/api/stocks", tags=["stocks"])
 logger = logging.getLogger(__name__)
@@ -234,3 +235,13 @@ def get_dashboard(code: str, db: Session = Depends(get_db)):
             "profit_growth_3y": profit_growth,
         },
     }
+
+
+@router.get("/{code}/xueqiu")
+def get_xueqiu_data(code: str):
+    """获取雪球行情与资金流向数据。"""
+    try:
+        return XueqiuClient().get_bundle(code)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("雪球数据获取失败 %s: %s", code, exc)
+        raise HTTPException(status_code=502, detail="雪球数据获取失败") from exc

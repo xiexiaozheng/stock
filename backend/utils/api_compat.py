@@ -15,6 +15,8 @@ from data_provider.source_config import (
     get_akshare_api_config,
     iter_akshare_sources,
 )
+from data_provider.error_classifier import ErrorCategory, classify_error
+from utils.akshare_runtime import prepare_akshare_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -106,15 +108,6 @@ def _build_call_kwargs(api_config: Mapping[str, Any], business_kwargs: Mapping[s
     return call_kwargs
 
 
-def _get_error_classifier():
-    try:
-        from data_provider.error_classifier import classify_error, ErrorCategory
-
-        return classify_error, ErrorCategory
-    except Exception:
-        return None, None
-
-
 def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapping[str, Any]) -> Any:
     source_config = dict(source_config)
     source_config.setdefault(
@@ -124,39 +117,55 @@ def _execute_source_call(source_config: Mapping[str, Any], business_kwargs: Mapp
     if not source_config.get("enabled", True):
         raise AttributeError(source_config.get("disabled_reason", "source disabled"))
 
-    import akshare as ak
-
-    func = _resolve_function(ak, source_config["api_function"])
     call_kwargs = _build_call_kwargs(source_config, business_kwargs)
     retry_policy = source_config.get("retry_policy", {}) or {}
     max_attempts = max(int(retry_policy.get("max_attempts", 1)), 1)
     backoff_seconds = float(retry_policy.get("backoff_seconds", 0.0) or 0.0)
-    classify_error, ErrorCategory = _get_error_classifier()
     last_error: Optional[Exception] = None
 
     for attempt in range(1, max_attempts + 1):
         try:
+            prepare_akshare_runtime(force_refresh=(attempt > 1))
+            import akshare as ak
+
+            func = _resolve_function(ak, source_config["api_function"])
             return func(**call_kwargs)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            category = classify_error(exc) if classify_error else None
-            should_retry = (
-                attempt < max_attempts
-                and category is not None
-                and category == ErrorCategory.TRANSIENT
+            category = classify_error(exc)
+            should_retry = attempt < max_attempts and category in (
+                ErrorCategory.TRANSIENT,
+                ErrorCategory.ANTI_CRAWL,
+                ErrorCategory.UNKNOWN,
             )
             if should_retry:
-                sleep_seconds = max(backoff_seconds, 0.5) * attempt
-                logger.warning(
-                    "akshare source %s transient failure on attempt %s/%s: %s; retry in %.1fs",
-                    source_config.get("api_function"),
-                    attempt,
-                    max_attempts,
-                    exc,
-                    sleep_seconds,
-                )
+                sleep_seconds = max(backoff_seconds, 0.5 if category == ErrorCategory.TRANSIENT else 3.0) * attempt
+                if category == ErrorCategory.ANTI_CRAWL:
+                    logger.warning(
+                        "akshare 接口 %s 疑似被短时封禁，等待中 %.1fs 后重试 (%s/%s): %s",
+                        source_config.get("api_function"),
+                        sleep_seconds,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "akshare source %s transient failure on attempt %s/%s: %s; retry in %.1fs",
+                        source_config.get("api_function"),
+                        attempt,
+                        max_attempts,
+                        exc,
+                        sleep_seconds,
+                    )
                 time.sleep(sleep_seconds)
                 continue
+            if category == ErrorCategory.ANTI_CRAWL:
+                logger.warning(
+                    "akshare 接口 %s 疑似被短时封禁，已达到最大重试次数: %s",
+                    source_config.get("api_function"),
+                    exc,
+                )
             raise
 
     if last_error is not None:
@@ -203,7 +212,6 @@ def call_akshare(api_key: str, **kwargs) -> Any:
     """统一的 AKShare 调用入口。"""
     config = get_akshare_api_config(api_key)
     all_tried = []
-    classify_error, _ = _get_error_classifier()
 
     enabled_sources = list(iter_akshare_sources(api_key, enabled_only=True))
     disabled_sources = list(iter_akshare_sources(api_key, enabled_only=False))
@@ -224,7 +232,7 @@ def call_akshare(api_key: str, **kwargs) -> Any:
             logger.debug("akshare 接口 %s 调用成功", source_config["api_function"])
             return result
         except Exception as exc:  # noqa: BLE001
-            category = classify_error(exc).value if classify_error else "unknown"
+            category = classify_error(exc).value
             all_tried.append(
                 {
                     "api": source_config["api_function"],
